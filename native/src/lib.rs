@@ -1,7 +1,11 @@
-//! Isolated feasibility ABI; controlled scenes only, not a replacement NES.
+//! RAM mirror ABI: legacy parity probes and explicitly seeded experimental play.
+//! Diagnostic builds expose their status and must not be used for training.
 mod engine;
+mod codec;
 mod extras;
 mod observe;
+#[cfg(test)]
+mod abi_tests;
 #[cfg(feature = "reference-rng")]
 mod random_replay;
 
@@ -15,6 +19,16 @@ struct Batch {
     engines: Vec<Engine>,
     max_frames: u32,
     stop_on_death: bool,
+    terminal: Vec<bool>,
+}
+
+/// SplitMix64-v1, using the high byte of each complete 64-bit output.
+#[unsafe(no_mangle)]
+pub extern "C" fn mirror_rng_version() -> u32 { 1 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mirror_diagnostic_build() -> u32 {
+    u32::from(cfg!(feature = "reference-rng"))
 }
 
 #[unsafe(no_mangle)]
@@ -49,7 +63,9 @@ pub unsafe extern "C" fn mirror_reference_step(
         return u32::MAX;
     }
     let batch = unsafe { &mut *handle.cast::<Batch>() };
-    if index >= batch.engines.len() || count > 4096 { return u32::MAX; }
+    if index >= batch.engines.len() || count > 4096 || batch.engines[index].is_seeded() {
+        return u32::MAX;
+    }
     let samples = if count == 0 {
         Vec::new()
     } else {
@@ -71,7 +87,9 @@ pub unsafe extern "C" fn mirror_reference_logic(
         return u32::MAX;
     }
     let batch = unsafe { &mut *handle.cast::<Batch>() };
-    if index >= batch.engines.len() || count > 4096 { return u32::MAX; }
+    if index >= batch.engines.len() || count > 4096 || batch.engines[index].is_seeded() {
+        return u32::MAX;
+    }
     let samples = if count == 0 {
         Vec::new()
     } else {
@@ -91,8 +109,7 @@ pub unsafe extern "C" fn mirror_native_logic(
     if handle.is_null() { return u32::MAX; }
     let batch = unsafe { &mut *handle.cast::<Batch>() };
     if index >= batch.engines.len() { return u32::MAX; }
-    batch.engines[index].logic_with_native_rng(input, pressed, tick, coarse);
-    0
+    batch.engines[index].logic_with_native_rng(input, pressed, tick, coarse)
 }
 
 #[unsafe(no_mangle)]
@@ -106,7 +123,29 @@ pub unsafe extern "C" fn mirror_create(ram: *const u8, count: usize, max_frames:
         initial.copy_from_slice(r);
         Engine::new(initial)
     }).collect();
-    Box::into_raw(Box::new(Batch { engines, max_frames, stop_on_death: true })).cast()
+    Box::into_raw(Box::new(Batch {
+        engines, max_frames, stop_on_death: true, terminal: vec![false; count],
+    })).cast()
+}
+
+/// Opt-in experimental full-game/multi-life simulation, not NES-equivalent RNG.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirror_create_seeded(
+    ram: *const u8, count: usize, max_frames: u32, seeds: *const u64,
+) -> *mut std::ffi::c_void {
+    if ram.is_null() || seeds.is_null() || count == 0 || count > 4096 || max_frames == 0 {
+        return std::ptr::null_mut();
+    }
+    let data = unsafe { slice::from_raw_parts(ram, count * engine::RAM_LEN) };
+    let seeds = unsafe { slice::from_raw_parts(seeds, count) };
+    let engines = data.chunks_exact(engine::RAM_LEN).zip(seeds).map(|(r, &seed)| {
+        let mut initial = [0; engine::RAM_LEN];
+        initial.copy_from_slice(r);
+        Engine::new_seeded(initial, seed)
+    }).collect();
+    Box::into_raw(Box::new(Batch {
+        engines, max_frames, stop_on_death: false, terminal: vec![false; count],
+    })).cast()
 }
 
 #[unsafe(no_mangle)]
@@ -152,6 +191,22 @@ pub unsafe extern "C" fn mirror_reset(handle: *mut std::ffi::c_void, index: usiz
     if index >= batch.engines.len() { return -2; }
     let engine = &mut batch.engines[index];
     engine.reset();
+    batch.terminal[index] = false;
+    observe::write(engine, batch.max_frames, unsafe { slice::from_raw_parts_mut(obs, observe::SIZE) });
+    0
+}
+
+/// Restore the original RAM and restart the seeded stream. Legacy handles return -3.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirror_reset_seeded(
+    handle: *mut std::ffi::c_void, index: usize, seed: u64, obs: *mut f32,
+) -> i32 {
+    if handle.is_null() || obs.is_null() { return -1; }
+    let batch = unsafe { &mut *handle.cast::<Batch>() };
+    if index >= batch.engines.len() { return -2; }
+    let engine = &mut batch.engines[index];
+    if !engine.reseed(seed) { return -3; }
+    batch.terminal[index] = false;
     observe::write(engine, batch.max_frames, unsafe { slice::from_raw_parts_mut(obs, observe::SIZE) });
     0
 }
@@ -197,6 +252,14 @@ pub unsafe extern "C" fn mirror_step(
     let statistics = unsafe { slice::from_raw_parts_mut(statistics, count * 5) };
     for i in 0..count {
         let engine = &mut batch.engines[i];
+        if engine.is_seeded() && batch.terminal[i] {
+            dones[i] = 1;
+            rewards[i] = 0.0;
+            statistics[i * 5..i * 5 + 5].copy_from_slice(
+                &[engine.frame, engine.kills, engine.deaths, engine.shots, engine.pickups]);
+            observe::write(engine, batch.max_frames, &mut obs[i * observe::SIZE..(i + 1) * observe::SIZE]);
+            continue;
+        }
         let (kills, deaths, frame) = (engine.kills, engine.deaths, engine.frame);
         let mut failed = false;
         for f in 0..4 {
@@ -212,12 +275,34 @@ pub unsafe extern "C" fn mirror_step(
         let elapsed = engine.frame - frame;
         let clear = !failed && engine.ram[0x80] == 0;
         dones[i] = u8::from(failed || clear || engine.frame >= batch.max_frames);
+        if engine.is_seeded() { batch.terminal[i] = dones[i] != 0; }
         rewards[i] = (engine.kills - kills) as f32 - 3.0 * (engine.deaths - deaths) as f32
             - 0.0005 * elapsed as f32 - if engine.ram[0x68] != 0x80 { 20.0 } else { 0.0 }
             + if clear { 5.0 } else { 0.0 };
         statistics[i * 5..i * 5 + 5].copy_from_slice(
             &[engine.frame, engine.kills, engine.deaths, engine.shots, engine.pickups]);
         observe::write(engine, batch.max_frames, &mut obs[i * observe::SIZE..(i + 1) * observe::SIZE]);
+    }
+    0
+}
+
+/// Fused outputs: mirror_step remains the only action-repeat/reward implementation.
+/// Each environment writes SIZE observations, 5 statistics and 10 action masks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirror_step_batch(
+    handle: *mut std::ffi::c_void, actions: *const u8, count: usize,
+    obs: *mut f32, rewards: *mut f32, dones: *mut u8, stats: *mut u32,
+    support: *mut u32, masks: *mut u8,
+) -> i32 {
+    if support.is_null() || masks.is_null() { return -1; }
+    let status = unsafe { mirror_step(handle, actions, count, obs, rewards, dones, stats) };
+    if status != 0 { return status; }
+    let batch = unsafe { &*handle.cast::<Batch>() };
+    let support = unsafe { slice::from_raw_parts_mut(support, count) };
+    let masks = unsafe { slice::from_raw_parts_mut(masks, count * 10) };
+    for (i, engine) in batch.engines.iter().enumerate() {
+        support[i] = engine.unsupported();
+        observe::masks(engine, &mut masks[i * 10..(i + 1) * 10]);
     }
     0
 }

@@ -17,7 +17,7 @@
 不能自动加时，也不能把混合奖励上升称为获胜能力提升。
 命令、预算、指标和结果目录见 [有限预算恢复实验](docs/recovery_experiments.md)。
 
-在原版 NES 模拟器中训练坦克 AI。代码只保留两种打法：
+原版 NES 模拟器仍是生产训练与验收基准。ROM 主线保留两种打法：
 
 - **MaskablePPO**：47×26×26 语义观测，10 个原始动作＋5 个启发式宏。
 - **启发式基线**：与学习策略共享状态、子弹威胁、射线和 26×26 寻路。
@@ -32,6 +32,31 @@
 已经贴住外边界且面向外侧时，重复的向外移动 / 开火被屏蔽；有用的转向、沿边移动、
 朝场内射击和正常拆砖仍保留。
 
+## 实验性 Rust 后端与无损内存优化
+
+独立入口为 [rust_train.py](rust_train.py)，不替换以上 ROM 主线。
+[Rust 镜像](native/src/engine.rs) 使用本项目最新的敌军、道具、计时器、碰撞次序与残砖逻辑，
+而不是旧性能 worktree 的引擎快照。性能方案只借鉴并适配无损 rollout、批量调用和缓冲区复用。
+
+- 使用版本化独立随机流，同 seed、同配置可复现；**不是 ROM 随机流复刻**。
+- 只用 **10 个原始动作**；不能直接加载现有 15 动作模型。
+- rollout 保留 float32 的每一位，仅按 minibatch 解压，可选 CUDA 展开；不做 float16 量化。
+- `--steps` 必须整除 `envs*n_steps`，拒绝超预算取整，不自动启动长训练。
+- 原版 ROM 用于一次性初始化地图和独立迁移评测，不参与 Rust rollout 的逐帧执行。
+
+```powershell
+cargo build --release --manifest-path native\Cargo.toml
+# 同配置 dense / compact 短对照，要求最终参数哈希一致
+uv run --no-sync python rust_train.py compare --output runs\rust-compare `
+  --device cuda --codec cuda --envs 32 --n-steps 64 --batch-size 256 --steps 4096
+# 在真实 ROM 中分别评测确定性和采样策略；不代表已经学会通关
+uv run --no-sync python rust_train.py eval --model runs\rust-compare\cuda\model.zip `
+  --output runs\rust-compare\rom-transfer.json --device cuda
+```
+
+当前能力边界、完整命令和延期事项见 [Rust 后端说明](docs/rust_backend.md)。
+不要把条件随机数一致的轨迹测试、短跑速度或压缩率当作独立 ROM parity 或胜率。
+
 ## 安装与测试
 
 Python 3.11，依赖由 `pyproject.toml` / `uv.lock` 固定。项目目录需要本地
@@ -39,6 +64,7 @@ Python 3.11，依赖由 `pyproject.toml` / `uv.lock` 固定。项目目录需要
 
 ```powershell
 uv sync
+cargo build --release --manifest-path native\Cargo.toml
 uv run python -m unittest discover -v
 ```
 

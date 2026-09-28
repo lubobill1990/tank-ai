@@ -40,6 +40,122 @@ The ignored external fixture-driver test requires local trace files; ordinary
 unit tests are self-contained. ROMs, DLLs, model archives and runs are excluded
 from Git. Supply your own ROM locally when running the Python ROM tests.
 
+## Standalone training mode
+
+`rust_train.py` deliberately uses ten primitive actions, 47 channels and a
+two-frame stack. It does not load production fifteen-action checkpoints or
+modify `train.py`. Each stage is initialized once with the user's local ROM;
+rollout steps and automatic episode resets use only Rust.
+
+Seeded mode uses SplitMix64-v1, taking the high byte of each successive 64-bit
+output. Per-environment/episode seeds are the first eight SHA256 bytes
+(little-endian) of `tank-ai-episode-v1:base_seed:stream:episode`. PPO supplies
+`base_seed = training_seed + environment_index`, and `stream` is that index.
+There is no shared RNG, oracle tape or random-state resynchronization. Native
+reset restores the initial RAM and explicitly seeds the independent stream.
+
+The seeded mode explicitly accepts enemy/spawn/item-drop/ice mechanics as
+experimental. Unknown terrain, P2 and unsupported stage continuation retain
+hard errors. Legacy mode retains its original restrictive parity flags.
+The Python training binding rejects a `reference-rng` diagnostic DLL.
+
+Sparse reward is +1 per kill, -3 per death, -20 for base loss, +5 for clear and
+-0.0005 per logical frame. Episodes span multiple lives, ending at base loss,
+final-life death, clear or timeout; a timeout is truncated, not a failure.
+Original-ROM shot/kill event-observer limitations remain documented below.
+
+Outputs go to a new directory: configuration, model, versioned/hash-bound
+manifest and measured result. They record seeds, initial RAM hashes, native
+source/library hashes, ROM identity and the action/observation/reward contract.
+These are policy checkpoints, **not simulator save states or exact training
+resume points**. Rebuilding or changing the stochastic backend needs a new run.
+
+```powershell
+# Small CPU smoke; steps must be a multiple of envs * n-steps.
+uv run --no-sync python rust_train.py train --output runs\rust-cpu-smoke `
+  --device cpu --codec native --envs 2 --n-steps 16 --batch-size 16 --steps 64
+
+# Identical short configurations in fresh processes, different storage only.
+uv run --no-sync python rust_train.py compare --output runs\rust-storage-check `
+  --device cuda --codec cuda --envs 32 --n-steps 64 --batch-size 256 --steps 4096
+
+# Separate original-ROM evaluation, both deterministic and sampled actions.
+uv run --no-sync python rust_train.py eval `
+  --model runs\rust-storage-check\cuda\model.zip `
+  --output runs\rust-storage-check\rom-transfer.json --device cuda
+
+uv run --no-sync python -m unittest test_rust_env test_rust_training `
+  test_compact_rollout test_native_rollout -v
+```
+
+## Memory contract
+
+The model-independent chronological stack buffer is reused from the performance
+experiment; its current native codec and batch adapter are wired to this
+repository's latest engine. No old `app/`, engine, fixed skill-only reset path or
+copied mechanics loop is used. Fused native stepping delegates to the same
+current `mirror_step` implementation as the unoptimized path.
+
+`dense` is the SB3 baseline; `zlib` uses lossless compression; `native` uses
+float32 bit runs with raw fallback; `cuda` expands run lengths and integer bit
+patterns on GPU. All preserve signed zero and NaN payloads without arithmetic
+conversion. Frame overlap deduplication is limited to adjacent steps in the same
+environment. Only minibatches are decoded; there is no dense rollout-sized
+observation allocation or persistent decoded epoch cache.
+
+The default 2 GiB cap covers accounted persistent buffer arrays, payloads and
+estimated Python overhead. It is **not** a process RSS, GPU-memory or transient
+allocation cap. Comparison reports distinguish rollout storage, peak process
+RSS and peak CUDA allocation. Public VecEnv outputs and terminal observations
+are owned snapshots; native work buffers can be reused without overwriting
+SB3's retained episode-start flags. Native low-level batch arrays are borrowed.
+
+Short comparison rejects unequal final policy hashes; matching hashes establish
+storage equivalence for the measured run, not higher win rates. Historical
+performance-worktree speedups do not apply automatically to this version.
+
+## Integration acceptance measurements
+
+On the local RTX 5090, a repeated fresh-process comparison used 32 environments,
+64 rollout steps, minibatches of 256, two epochs, 4,096 transitions per run,
+stages 1/5/10/20/35, seed 37 and a 600-frame episode cap:
+
+| Metric | Current engine + dense buffer | Current engine + CUDA bit runs |
+|---|---:|---:|
+| Accounted rollout storage | 496.58 MiB | 15.57 MiB |
+| Peak process working set | 2.93 GiB | 2.01 GiB |
+| Peak allocated CUDA memory | 347.40 MiB | 370.04 MiB |
+| Training transitions/second | 1,507 | 2,146 |
+
+Final policy parameter hashes were identical:
+`15c36e3abb468246a682470b97e96f21976b21ba38df80748c59dc5ed198a2ac`.
+This repeat measured about 31.9x smaller rollout storage and 1.42x throughput,
+not a 31.9x reduction in total memory. The first short comparison, concurrent
+with a CPU stage soak, measured 1.70x throughput; timing is workload-sensitive.
+GPU allocation increased slightly. Both comparisons changed storage only;
+neither is a new speed comparison against the ROM emulator.
+
+Further acceptance:
+
+- Final regression: 294 Python tests passed, including a generated latest-engine
+  snapshot and the external-working-directory comparison regression. Native
+  tests passed in default (78) and diagnostic (84) builds; the external trace
+  fixture driver remains explicitly ignored in these self-contained suites.
+- Latest seeded backend: all 35 stages completed episodes during 105,000 random
+  masked decisions; no unsupported-feature errors or nonfinite observations.
+  Completed episodes covered 395,071 frames. This is runtime coverage, not parity.
+- CPU dense/zlib/native short training produced identical policy hashes, with
+  episode resets and time-limit bootstrapping exercised.
+- Float-bit, action-mask, return/advantage and CUDA/raw-fallback tests passed.
+- Original-ROM transfer ran 20 episodes (five stages, two seeds, deterministic
+  and sampled actions) at the same 600-frame cap: zero clears, 18 timeouts and
+  two base losses. This validates the evaluation pipeline only.
+
+Detailed reports and short-run checkpoints are local under
+`runs/rust-latest-acceptance-cuda/` and
+`runs/rust-latest-acceptance-cuda-repeat/`, excluded from Git. No long training
+was started.
+
 ## Deferred work
 
 - [ ] Reconstruct the between-update memory side effects consumed by ROM RNG,

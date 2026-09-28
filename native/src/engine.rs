@@ -1,4 +1,4 @@
-//! Isolated mechanics feasibility experiment, not a replacement NES emulator.
+//! RAM gameplay mirror with legacy parity probes and opt-in seeded experiments.
 
 #[path = "enemies.rs"]
 mod enemies;
@@ -7,12 +7,14 @@ pub const RAM_LEN: usize = 2048;
 pub const SUPPORTED: &str = "Verified no-spawn skill scenes after two neutral NES frames: \
     delayed controller input, player movement/turns, projectiles, residual bricks, \
     frozen targets, bullet cancellation, armor, pickups, timed fortress, ice coasting and death events. \
-    Experimental cartridge-derived enemy state machine, RNG, fire and spawning.";
-pub const LIMITATIONS: &str = "Not a NES emulator. Enemy/spawn flags remain unsupported: \
+    Cartridge-derived enemy state machine, fire, spawning and drops have conditional RNG parity. \
+    Seeded experimental mode acknowledges these mechanics and ice, using SplitMix64-v1, not NES RNG.";
+pub const LIMITATIONS: &str = "Not a NES emulator. Legacy enemy/spawn/drop flags remain unsupported: \
     the exact RNG reads transient zero-page audio/NMI scratch not reconstructed by this RAM-only mirror. \
     Long host-frame traces also exhibit preterminal 0/2 tick deltas; NMI/host-frame phase is not modeled. \
-    Ice remains flagged pending long-trajectory validation despite passing bounded movement probes. \
-    No menus, terminal-state continuation, stage transition, PPU/audio, or aligned random item drops. \
+    Legacy ice remains flagged pending long-trajectory validation despite bounded movement parity. \
+    Seeded experimental trajectories are reproducible, not emulator-equivalent. \
+    No menus, terminal-state continuation, stage transition, PPU/audio, or autonomous aligned drops. \
     Raw RAM outside modeled fields is retained, not emulated. \
     Call unsupported() to detect unsupported scene mechanics encountered.";
 pub const UNSUPPORTED_ENEMIES: u32 = 1;
@@ -25,6 +27,22 @@ pub const UNSUPPORTED_P2: u32 = 128;
 
 const DELTA: [(i16, i16); 4] = [(0, -1), (-1, 0), (0, 1), (1, 0)];
 
+struct SeededRng {
+    seed: u64,
+    state: u64,
+}
+
+impl SeededRng {
+    fn next_byte(&mut self) -> u8 {
+        // SplitMix64-v1: one complete output per request, taking its high byte.
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        ((value ^ (value >> 31)) >> 56) as u8
+    }
+}
+
 pub struct Engine {
     pub ram: [u8; RAM_LEN],
     pub frame: u32,
@@ -36,12 +54,21 @@ pub struct Engine {
     pending_input: u8,
     last_input: u8,
     unsupported: u32,
+    seeded_rng: Option<SeededRng>,
     #[cfg(feature = "reference-rng")]
     reference_rng: Option<crate::random_replay::RandomReplay>,
 }
 
 impl Engine {
     pub fn new(ram: [u8; RAM_LEN]) -> Self {
+        Self::with_seed(ram, None)
+    }
+
+    pub fn new_seeded(ram: [u8; RAM_LEN], seed: u64) -> Self {
+        Self::with_seed(ram, Some(seed))
+    }
+
+    fn with_seed(ram: [u8; RAM_LEN], seed: Option<u64>) -> Self {
         let mut engine = Self {
             ram,
             initial: ram,
@@ -53,6 +80,7 @@ impl Engine {
             pending_input: 0,
             last_input: 0,
             unsupported: 0,
+            seeded_rng: seed.map(|seed| SeededRng { seed, state: seed }),
             #[cfg(feature = "reference-rng")]
             reference_rng: None,
         };
@@ -61,7 +89,19 @@ impl Engine {
     }
 
     pub fn reset(&mut self) {
-        *self = Self::new(self.initial);
+        *self = Self::with_seed(self.initial, self.seeded_rng.as_ref().map(|rng| rng.seed));
+    }
+
+    pub fn is_seeded(&self) -> bool {
+        self.seeded_rng.is_some()
+    }
+
+    pub fn reseed(&mut self, seed: u64) -> bool {
+        if !self.is_seeded() {
+            return false;
+        }
+        *self = Self::new_seeded(self.initial, seed);
+        true
     }
 
     pub fn unsupported(&self) -> u32 {
@@ -69,6 +109,12 @@ impl Engine {
     }
 
     pub(crate) fn random_byte(&mut self) -> u8 {
+        if let Some(rng) = &mut self.seeded_rng {
+            self.ram[0x10] = self.ram[0x10].wrapping_add(1);
+            let result = rng.next_byte();
+            self.ram[0x0f] = result;
+            return result;
+        }
         // $D44D mixes the incremented zero-page cursor, including ADC carry.
         let first = u16::from(self.ram[0x0f].wrapping_mul(7)) + u16::from(self.ram[0x0a]);
         self.ram[0x10] = self.ram[0x10].wrapping_add(1);
@@ -88,6 +134,7 @@ impl Engine {
 
     #[cfg(feature = "reference-rng")]
     pub fn step_with_reference_rng(&mut self, action: u8, samples: &[(u8, u8)]) -> u32 {
+        if self.is_seeded() { return u32::MAX; }
         self.reference_rng = Some(crate::random_replay::RandomReplay::new(samples));
         self.step(action);
         self.reference_rng.take().expect("diagnostic replay initialized").status()
@@ -104,6 +151,7 @@ impl Engine {
     pub fn logic_with_reference_rng(
         &mut self, input: u8, pressed: u8, tick: u8, coarse: u8, samples: &[(u8, u8)],
     ) -> u32 {
+        if self.is_seeded() { return u32::MAX; }
         self.reference_rng = Some(crate::random_replay::RandomReplay::new(samples));
         self.frame = self.frame.wrapping_add(1);
         self.ram[0x06] = input;
@@ -115,7 +163,8 @@ impl Engine {
     }
 
     #[cfg(feature = "reference-rng")]
-    pub fn logic_with_native_rng(&mut self, input: u8, pressed: u8, tick: u8, coarse: u8) {
+    pub fn logic_with_native_rng(&mut self, input: u8, pressed: u8, tick: u8, coarse: u8) -> u32 {
+        if self.is_seeded() { return u32::MAX; }
         self.reference_rng = None;
         self.frame = self.frame.wrapping_add(1);
         self.ram[0x06] = input;
@@ -123,6 +172,7 @@ impl Engine {
         self.ram[0x0b] = tick;
         self.ram[0x0a] = coarse;
         self.advance_gameplay(input, pressed);
+        0
     }
 
     pub fn step(&mut self, action: u8) {
@@ -188,7 +238,7 @@ impl Engine {
     }
 
     fn check_support(&mut self) {
-        if self.ram[0x7f] != 0 {
+        if !self.is_seeded() && self.ram[0x7f] != 0 {
             self.unsupported |= UNSUPPORTED_SPAWNING;
         }
         if active(self.ram[0xa1]) {
@@ -197,14 +247,15 @@ impl Engine {
         if self.ram[0x80] == 0 || self.ram[0x68] != 0x80 || self.ram[0x51] == 0 {
             self.unsupported |= UNSUPPORTED_STAGE_END;
         }
-        if self.ram[0x100] == 0 && self.ram[0xa2..0xa8].iter().any(|&s| active(s)) {
+        if !self.is_seeded()
+            && self.ram[0x100] == 0 && self.ram[0xa2..0xa8].iter().any(|&s| active(s)) {
             self.unsupported |= UNSUPPORTED_ENEMIES;
         }
         for row in 2..28 {
             for col in 2..28 {
                 let a = 0x400 + row * 32 + col;
                 let value = clean(self.ram[a]);
-                if value == 33 {
+                if !self.is_seeded() && value == 33 {
                     self.unsupported |= UNSUPPORTED_ICE;
                 }
                 if !matches!(value, 0..=16 | 18 | 32..=34 | 200..=207) {
@@ -359,7 +410,9 @@ impl Engine {
                 self.ram[0xcc + bullet] = 0x33;
                 let attribute = self.ram[0xa8 + tank];
                 if attribute & 4 != 0 {
-                    self.unsupported |= UNSUPPORTED_ITEM_DROP;
+                    if !self.is_seeded() {
+                        self.unsupported |= UNSUPPORTED_ITEM_DROP;
+                    }
                     self.ram[0x5a] = tank as u8;
                     self.ram[0x5b] = bullet as u8;
                     self.extras_drop_item();
@@ -541,6 +594,131 @@ mod tests {
         r[0x98] = 160;
         r[0xa0] = 0x88;
         r
+    }
+
+    #[test]
+    fn seeded_rng_uses_splitmix64_top_bytes_and_keeps_observable_cursor() {
+        let mut ram = scene();
+        ram[0x10] = 254;
+        let mut e = Engine::new_seeded(ram, 0);
+        for (i, expected) in [0xe2, 0x6e, 0x06, 0xf8, 0x1b, 0x53, 0x2c, 0xc5]
+            .into_iter().enumerate()
+        {
+            assert_eq!(e.random_byte(), expected);
+            assert_eq!(e.ram[0x0f], expected);
+            assert_eq!(e.ram[0x10], 254u8.wrapping_add(i as u8 + 1));
+        }
+        let mut other = Engine::new_seeded(ram, 1);
+        assert_eq!(other.random_byte(), 0x91);
+        assert_eq!(other.random_byte(), 0xbe);
+    }
+
+    #[test]
+    fn seeded_rng_streams_are_independent_of_interleaving_and_ram_scratch() {
+        let mut a = Engine::new_seeded(scene(), 0);
+        let mut b = Engine::new_seeded(scene(), 1);
+        let mut solo_a = Engine::new_seeded(scene(), 0);
+        let mut solo_b = Engine::new_seeded(scene(), 1);
+        for i in 0..64 {
+            a.ram[0x0a] = i;
+            a.ram[0x0f] = 255;
+            if i % 2 == 0 {
+                assert_eq!(b.random_byte(), solo_b.random_byte());
+                assert_eq!(a.random_byte(), solo_a.random_byte());
+            } else {
+                assert_eq!(a.random_byte(), solo_a.random_byte());
+                assert_eq!(b.random_byte(), solo_b.random_byte());
+            }
+            for _ in 0..i % 3 {
+                assert_eq!(b.random_byte(), solo_b.random_byte());
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_reset_and_reseed_restore_ram_counters_pipeline_and_stream() {
+        let ram = enemy_scene();
+        let mut e = Engine::new_seeded(ram, 0);
+        for _ in 0..8 { e.step(129); }
+        let expected = e.ram;
+        let expected_rng = e.random_byte();
+        e.reset();
+        assert_eq!(e.ram, ram);
+        assert_eq!((e.frame, e.kills, e.deaths, e.shots, e.pickups), (0, 0, 0, 0, 0));
+        for _ in 0..8 { e.step(129); }
+        assert_eq!(e.ram, expected);
+        assert_eq!(e.random_byte(), expected_rng);
+        assert!(e.reseed(1));
+        assert_eq!(e.ram, ram);
+        assert_eq!(e.random_byte(), 0x91);
+        e.reset();
+        assert_eq!(e.random_byte(), 0x91);
+        let mut legacy = Engine::new(ram);
+        assert!(!legacy.reseed(1));
+        assert_eq!(legacy.ram, ram);
+        assert!(!legacy.is_seeded());
+    }
+
+    #[test]
+    fn seeded_support_only_acknowledges_verified_experimental_mechanics() {
+        let mut r = enemy_scene();
+        r[0x7f] = 1;
+        r[0x442] = 33;
+        let legacy = Engine::new(r);
+        assert_eq!(legacy.unsupported(),
+            UNSUPPORTED_ENEMIES | UNSUPPORTED_SPAWNING | UNSUPPORTED_ICE);
+        let mut e = Engine::new_seeded(r, 0);
+        assert_eq!(e.unsupported(), 0);
+        e.ram[0x443] = 255;
+        e.ram[0xa1] = 0x80;
+        e.ram[0x80] = 0;
+        e.step(0);
+        assert_eq!(e.unsupported(),
+            UNSUPPORTED_TERRAIN | UNSUPPORTED_P2 | UNSUPPORTED_STAGE_END);
+    }
+
+    #[test]
+    fn seeded_invalid_spawn_configuration_is_still_flagged() {
+        let mut r = scene();
+        r[0x7f] = 1;
+        r[0x6c] = 0;
+        let mut e = Engine::new_seeded(r, 0);
+        e.step(0);
+        assert_eq!(e.unsupported(), UNSUPPORTED_SPAWNING);
+    }
+
+    #[test]
+    fn seeded_red_tank_drop_consumes_seed_stream_without_legacy_drop_flag() {
+        let mut r = scene();
+        r[0x100] = 10;
+        r[0x92] = 88;
+        r[0x9a] = 80;
+        r[0xa2] = 0xa2;
+        r[0xaa] = 0x84;
+        r[0xb8] = 88;
+        r[0xc2] = 90;
+        r[0xcc] = 0x40;
+        let mut seeded = Engine::new_seeded(r, 0);
+        seeded.step(0);
+        assert_eq!((seeded.ram[0x86], seeded.ram[0x87], seeded.ram[0x88]), (144, 144, 4));
+        assert_eq!((seeded.ram[0x10], seeded.ram[0xf]), (3, 6));
+        assert_eq!(seeded.unsupported(), 0);
+        let mut legacy = Engine::new(r);
+        legacy.step(0);
+        assert_eq!(legacy.unsupported(), UNSUPPORTED_ITEM_DROP);
+    }
+
+    #[cfg(feature = "reference-rng")]
+    #[test]
+    fn seeded_engines_reject_all_diagnostic_updates_without_mutation() {
+        let ram = enemy_scene();
+        let mut e = Engine::new_seeded(ram, 0);
+        assert_eq!(e.step_with_reference_rng(128, &[]), u32::MAX);
+        assert_eq!(e.logic_with_reference_rng(128, 128, 1, 2, &[]), u32::MAX);
+        assert_eq!(e.logic_with_native_rng(128, 128, 1, 2), u32::MAX);
+        assert_eq!(e.ram, ram);
+        assert_eq!(e.frame, 0);
+        assert_eq!(e.random_byte(), 0xe2);
     }
 
     #[test]
