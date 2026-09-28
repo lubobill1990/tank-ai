@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+runs/
+*.log
+*.nes
+*.mp4
+*.zip
+.env
+.env.*
+!.env.example
+native/target/
+native/target-*/
+*.dll
+*.pyd
+*.pdb
