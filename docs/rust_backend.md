@@ -117,7 +117,8 @@ alone cannot qualify a model as improving in the cartridge.
 
 Stop conditions are the exact transition cap, one-hour whole-trial wall cap,
 three completed validation checks without improvement, or an explicit runtime/
-nonfinite failure. Incomplete evaluations remain incomplete and cannot be
+nonfinite failure. Host resource pressure is also a stop condition, not evidence
+that a policy failed to learn. Incomplete evaluations remain incomplete and cannot be
 presented as successes; no trial automatically extends its budget.
 
 Each checkpoint has its own versioned manifest with model/history/action
@@ -130,6 +131,48 @@ Monitoring uses immutable durable status records; a sharing-locked Windows
 display pointer must not terminate otherwise healthy training. Read authoritative
 status through `rust_learning.read_status`. All completed trial/checkpoint and
 validation records are retained, including unsuccessful or stopped trials.
+
+### Host resource protection
+
+The monitored `study`/`learn` path records `resources.jsonl` in the study and each
+trial directory. The current collector uses Windows commit counters, process
+private/working-set memory, and CUDA allocated/reserved/peak allocated memory
+after CUDA is initialized. It does not initialize CUDA merely to collect a
+sample. Unsupported hosts or counter errors fail explicitly; the legacy
+`train`/`compare`/`eval` commands are unchanged.
+
+The runtime keeps an **8 GiB system commit headroom** threshold. Admission adds
+an **8 GiB startup allowance per concurrent worker slot**: 16 GiB for one slot,
+24 GiB when admitting a second worker. This conservatively includes workers that
+have started but have not yet allocated their training buffers. Headroom means
+Windows commit limit minus committed bytes, not free VRAM or free physical RAM.
+These are heuristic safety reserves, not OS-enforced reservations or a promise
+against concurrent allocations by other applications.
+
+Sampling is throttled to once per second during rollout/evaluation decisions and
+the supervisor loop, and forced before admission, optimizer updates and
+checkpoints. Pressure stops new work without automatic retry, marks the trial
+`incomplete` with `stop_reason=resource_pressure`, and keeps its last optimized
+checkpoint. It does not save partially updated weights as a final model. A
+supervisor pressure/error abort terminates only its owned child process trees;
+their last observed exposure is not claimed to be exact. No system/pagefile
+settings or unrelated processes are changed.
+
+Unexpected exceptions retain full tracebacks. Trial `failure.json` and
+`supervisor-failure.json` are small failure records independent of the normal
+large reports. Status/result JSON and report bodies are streamed to avoid
+whole-document string/byte copies. Immutable status publication and sharing-lock
+handling remain unchanged. Telemetry is flushed for live inspection; completed
+failure/result records are fsynced. An exhausted OS or failed disk can still
+prevent a write, in which case errors propagate rather than claiming success.
+
+The first six-trial study stopped abnormally and is preserved, not overwritten.
+A separate six-update history diagnostic (49,152 transitions, with two explicitly
+short smoke evaluations) showed private memory stabilizing around 7.46 GiB after
+warm-up; it did not reproduce continuous growth. That does not establish the
+cause of the earlier allocation failures or validate long-run stability. Changes
+to monitoring still change the frozen source signature; old checkpoints are not
+silently accepted as exact continuation under new code.
 
 Sparse reward is +1 per kill, -3 per death, -20 for base loss, +5 for clear and
 -0.0005 per logical frame. Episodes span multiple lives, ending at base loss,

@@ -11,11 +11,15 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 import warnings
+
+from rust_resources import ResourceMonitor, ResourcePressureError
 
 ROOT = Path(__file__).resolve().parent
 SCHEMA_VERSION = 1
@@ -34,13 +38,10 @@ def _hash(path):
     return digest.hexdigest()
 
 
-def _json_bytes(value):
-    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + '\n').encode('utf-8')
-
-
 def _write_new(path, value):
-    with Path(path).open('xb') as stream:
-        stream.write(_json_bytes(value))
+    with Path(path).open('x', encoding='utf-8', newline='\n') as stream:
+        json.dump(value, stream, sort_keys=True, indent=2, allow_nan=False)
+        stream.write('\n')
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -76,27 +77,24 @@ class StatusWriter:
                 f'Monitor cleanup sharing lock on {path}: {error}; authoritative snapshot path: {snapshot}')
 
     def write(self, status):
-        payload = _json_bytes(status)
-        if payload == self.previous:
-            return
         self.sequence = max(time.time_ns(), self.sequence + 1)
         stem = f'{self.name}-{self.sequence:020d}-{uuid.uuid4().hex}'
         snapshot = self.directory / (stem + '.json')
         temporary = self.directory / (stem + '.tmp')
         try:
-            with temporary.open('xb') as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
+            _write_new(temporary, status)
+            digest = _hash(temporary)
+            if digest == self.previous:
+                return
             # Publish a new immutable name only after the complete payload is durable.
             os.rename(temporary, snapshot)
         finally:
             self._cleanup(temporary, snapshot)
-        self.previous = payload
+        self.previous = digest
         pending = self.directory / (stem + '.pending')
         try:
-            with pending.open('xb') as stream:
-                stream.write(payload)
+            with snapshot.open('rb') as source, pending.open('xb') as stream:
+                shutil.copyfileobj(source, stream, length=1024 * 1024)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(pending, self.directory / (self.name + '.json'))
@@ -488,13 +486,14 @@ def run_training_loop(runtime, config, *, evaluate, save, publish, clock=time.mo
             record.update(status='completed', metrics=metrics, selection_score=list(selection_score(metrics)))
             if improved:
                 checkpoint('best')
-        except (TimeoutError, FloatingPointError) as error:
-            record.update(status='incomplete', error=str(error))
+        except (TimeoutError, FloatingPointError, ResourcePressureError) as error:
+            record.update(status='incomplete', error=str(error), traceback=traceback.format_exc())
             if hasattr(error, 'partial_results'):
                 record['partial_results'] = error.partial_results
             raise
         except Exception as error:
-            record.update(status='failed', error=f'{type(error).__name__}: {error}')
+            record.update(status='failed', error=f'{type(error).__name__}: {error}',
+                          traceback=traceback.format_exc())
             raise
         snapshot('validated')
 
@@ -523,13 +522,16 @@ def run_training_loop(runtime, config, *, evaluate, save, publish, clock=time.mo
         if report['stop_reason'] is None:
             report['stop_reason'] = 'step_cap'
     except TimeoutError as error:
-        report.update(stop_reason='wall_cap', error=str(error))
+        report.update(stop_reason='wall_cap', error=str(error), traceback=traceback.format_exc())
+    except ResourcePressureError as error:
+        report.update(stop_reason='resource_pressure', error=str(error), traceback=traceback.format_exc())
     except FloatingPointError as error:
-        report.update(stop_reason='nonfinite', error=str(error))
+        report.update(stop_reason='nonfinite', error=str(error), traceback=traceback.format_exc())
     except Exception as error:
-        report.update(stop_reason='error', error=f'{type(error).__name__}: {error}')
+        report.update(stop_reason='error', error=f'{type(error).__name__}: {error}',
+                      traceback=traceback.format_exc())
     # A nonfinite optimizer must never become a valid final checkpoint.
-    if report['stop_reason'] not in ('nonfinite', 'error'):
+    if report['stop_reason'] not in ('nonfinite', 'error', 'resource_pressure'):
         checkpoint('final')
         if clock() >= deadline:
             report['stop_reason'] = 'wall_cap'
@@ -545,9 +547,13 @@ def run_training_loop(runtime, config, *, evaluate, save, publish, clock=time.mo
             selection_score(metrics)
             record.update(status='completed', metrics=metrics)
         except Exception as error:
-            record.update(status='incomplete', error=f'{type(error).__name__}: {error}')
+            record.update(status='incomplete', error=f'{type(error).__name__}: {error}',
+                          traceback=traceback.format_exc())
+            report.update(error=record['error'], traceback=record['traceback'])
             if isinstance(error, TimeoutError):
                 report['stop_reason'] = 'wall_cap'
+            elif isinstance(error, ResourcePressureError):
+                report['stop_reason'] = 'resource_pressure'
             elif isinstance(error, FloatingPointError):
                 report['stop_reason'] = 'nonfinite'
             else:
@@ -562,7 +568,7 @@ def run_training_loop(runtime, config, *, evaluate, save, publish, clock=time.mo
 
 
 class TrainingRuntime:
-    def __init__(self, config, initial, deadline):
+    def __init__(self, config, initial, deadline, resources=None):
         import numpy as np
         import torch
         from sb3_contrib import MaskablePPO
@@ -572,6 +578,7 @@ class TrainingRuntime:
         from rust_models import extractor_class, model_spec
         from rust_train import _buffer_kwargs, _configure
         _configure(config.device)
+        self.resources = resources
         self.config, self.optimized_steps, self.collected_steps = config, 0, 0
         self.episodes, self.updates, self.peak_storage = [], [], 0
         self.undefined_diagnostic_counts = {}
@@ -590,6 +597,8 @@ class TrainingRuntime:
             class BudgetCallback(BaseCallback):
                 def _on_step(self):
                     runtime.collected_steps = self.model.num_timesteps
+                    if runtime.resources is not None:
+                        runtime.resources.check('rollout')
                     if not np.isfinite(self.locals['rewards']).all():
                         raise FloatingPointError('Nonfinite native training reward')
                     for index, info in enumerate(self.locals['infos']):
@@ -623,6 +632,8 @@ class TrainingRuntime:
         self.collected_steps = self.model.num_timesteps
         if not collected or time.monotonic() >= deadline:
             return False
+        if self.resources is not None:
+            self.resources.check('optimizer', force=True)
         self.model._update_current_progress_remaining(self.model.num_timesteps, self.total)
         self.model.train()
         metrics, undefined = _training_metrics(self.model)
@@ -642,6 +653,7 @@ class TrainingRuntime:
     def diagnostics(self):
         import torch
         return {'completed_episodes': self.episodes, 'optimizer_metrics': self.updates,
+                'resources': self.resources.latest if self.resources is not None else None,
                 'undefined_diagnostic_counts': self.undefined_diagnostic_counts,
                 'rollout_storage_bytes': self._storage(), 'peak_rollout_storage_bytes': self.peak_storage,
                 'gpu_decoded_minibatches': getattr(self.model.rollout_buffer, 'gpu_decoded_minibatches', 0),
@@ -705,8 +717,17 @@ def run_trial(config, provenance):
     writer = StatusWriter(directory)
     runtime = None
     report = None
+    last_report = None
     checkpoints = {}
+    resources = ResourceMonitor(directory / 'resources.jsonl', device=config.device)
+
+    def publish(status):
+        nonlocal last_report
+        last_report = status
+        writer.write(status)
+
     try:
+        resources.check('initializing', admission_slots=1, force=True)
         initial_stages = verify_frozen(provenance)
         if list(config.stages) != provenance['stages']:
             raise ValueError('Trial stage mapping differs from frozen RAM')
@@ -717,11 +738,12 @@ def run_trial(config, provenance):
                                               'contract': learning_contract(config.model), 'memory': memory,
                                               'initial_env_ram_sha256': [
                                                   hashlib.sha256(row.tobytes()).hexdigest() for row in initial]})
-        writer.write({'phase': 'initializing', 'status': 'running', 'optimized_steps': 0})
+        publish({'phase': 'initializing', 'status': 'running', 'optimized_steps': 0})
         deadline = started + config.max_wall_seconds
-        runtime = TrainingRuntime(config, initial, deadline)
+        runtime = TrainingRuntime(config, initial, deadline, resources=resources)
 
         def save(role, step):
+            resources.check('checkpoint', force=True)
             record = _save_checkpoint(runtime, config, provenance, role, step)
             checkpoints[role] = record
             return record
@@ -729,23 +751,25 @@ def run_trial(config, provenance):
         def evaluate(step, confirmation=False):
             from rust_validation import evaluate_suite
             verify_frozen(provenance)
+            resources.check('confirmation' if confirmation else 'validation', force=True)
             model = (load_learning_checkpoint(checkpoints['best']['path'], device=config.device)
                      if confirmation else runtime.model)
             return evaluate_suite(
                 model, model_name=config.model,
                 stages=config.confirm_stages if confirmation else config.eval_stages,
                 seeds=config.confirm_seeds if confirmation else config.eval_seeds,
-                max_frames=FORMAL_MAX_FRAMES, deadline=deadline)
+                max_frames=FORMAL_MAX_FRAMES, deadline=deadline,
+                resource_check=lambda: resources.check('validation'))
 
         report = run_training_loop(runtime, config, evaluate=evaluate, save=save,
-                                   publish=writer.write, started=started)
+                                   publish=publish, started=started)
     except Exception as error:
-        try:
-            report = read_status(directory)
-        except StatusUnavailableError:
-            report = {'checkpoints': list(checkpoints.values())}
-        report.update(status='failed', stop_reason='error', learning_effect_valid=False,
+        report = last_report if last_report is not None else {'checkpoints': list(checkpoints.values())}
+        pressure = isinstance(error, ResourcePressureError)
+        report.update(status='incomplete' if pressure else 'failed',
+                      stop_reason='resource_pressure' if pressure else 'error', learning_effect_valid=False,
                       error=f'{type(error).__name__}: {error}',
+                      traceback=traceback.format_exc(),
                       optimized_steps=runtime.optimized_steps if runtime else 0,
                       collected_steps=runtime.collected_steps if runtime else 0,
                       wall_seconds=time.monotonic() - started)
@@ -757,7 +781,15 @@ def run_trial(config, provenance):
                 if report is None:
                     raise
                 report.update(status='failed', stop_reason='error', learning_effect_valid=False,
-                              error=f"{report.get('error', '')} Cleanup {type(error).__name__}: {error}".strip())
+                              error=f"{report.get('error', '')} Cleanup {type(error).__name__}: {error}".strip(),
+                              cleanup_traceback=traceback.format_exc())
+    if report.get('error'):
+        failure = {key: report.get(key) for key in (
+            'status', 'stop_reason', 'optimized_steps', 'collected_steps',
+            'error', 'traceback', 'cleanup_traceback', 'latest', 'best')}
+        failure.update(model=config.model, seed=config.seed, resources=resources.latest,
+                       learning_effect_valid=False, automatic_retry=False)
+        _write_new(directory / 'failure.json', failure)
     report.update(model=config.model, seed=config.seed, config=config.to_dict(), provenance=provenance,
                   exposure_exact=True,
                   progress=_progress(report), wall_seconds=time.monotonic() - started,
@@ -788,15 +820,17 @@ def write_results(path, reports):
                      f"{report.get('stop_reason', '?')} | {report.get('optimized_steps', 0)} / "
                      f"{report.get('collected_steps', 0)} | {report.get('wall_seconds', 0):.1f} | "
                      f"{report.get('checkpoint_storage_bytes', 0)} |")
-    for report in reports:
-        lines.extend(['', f"## {report.get('model', '?')} seed {report.get('seed', '?')}",
-                      f"Learning-effect evaluation valid: {report.get('learning_effect_valid', False)}.",
-                      'All latest/best/final checkpoints are retained. See result.json for every raw case.',
-                      '', '```json', json.dumps(report.get('progress', {}), indent=2, allow_nan=False), '```'])
-        if report.get('error'):
-            lines.append('Error: ' + report['error'])
     with Path(path).open('x', encoding='utf-8') as stream:
         stream.write('\n'.join(lines) + '\n')
+        for report in reports:
+            stream.write(f"\n## {report.get('model', '?')} seed {report.get('seed', '?')}\n"
+                         f"Learning-effect evaluation valid: {report.get('learning_effect_valid', False)}.\n"
+                         'All latest/best/final checkpoints are retained. See result.json for every raw case.\n'
+                         '\n```json\n')
+            json.dump(report.get('progress', {}), stream, indent=2, allow_nan=False)
+            stream.write('\n```\n')
+            if report.get('error'):
+                stream.write('Error: ' + report['error'] + '\n')
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -878,9 +912,12 @@ def study(args):
     writer = StatusWriter(output, 'batch')
     pending = list(manifest['trials'])
     active, results, states = {}, [], {}
+    resources = ResourceMonitor(output / 'resources.jsonl')
     try:
         while pending or active:
+            resources.check('supervisor')
             while pending and len(active) < args.parallel:
+                resources.check('admission', admission_slots=len(active) + 1, force=True)
                 record = pending.pop(0)
                 verify_frozen(manifest['provenance'])
                 log = (output / f"{record['model']}-seed{record['seed']}.log").open('xb')
@@ -953,13 +990,23 @@ def study(args):
             if active:
                 time.sleep(0.5)
     except BaseException as error:
+        failure_traceback = traceback.format_exc()
+        traceback.print_exc()
         for _, record, _, _ in active.values():
             states[record['output']]['status'] = 'interrupted'
         for record in pending:
             states[record['output']] = {'status': 'not_started'}
-        writer.write({'status': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
-                      'trials': states, 'pending': len(pending), 'active': 0, 'completed': len(results),
-                      'error': f'{type(error).__name__}: {error}', 'automatic_retry': False})
+        failure = {
+            'status': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
+            'trials': {path: {key: value for key, value in state.items() if key != 'monitor'}
+                       for path, state in states.items()},
+            'pending': len(pending), 'active': 0, 'completed': len(results),
+            'error': f'{type(error).__name__}: {error}', 'traceback': failure_traceback,
+            'resources': resources.latest, 'automatic_retry': False, 'exposure_exact': False,
+            'note': 'Supervisor aborted; use signed per-trial results where present, otherwise last checkpoints.',
+        }
+        _write_new(output / 'supervisor-failure.json', failure)
+        writer.write(failure)
         raise
     finally:
         for process, _, log, _ in active.values():

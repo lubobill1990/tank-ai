@@ -159,6 +159,26 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(policy.starts, 64)
         self.assertEqual(policy.calls, 192)
 
+    def test_resource_pressure_between_decisions_restores_rng_and_policy_mode(self):
+        from rust_resources import ResourcePressureError
+        module = self.module()
+        policy = PrimitivePolicy()
+        saved = self.snapshot_rng()
+        checks = 0
+
+        def check():
+            nonlocal checks
+            checks += 1
+            if checks == 4:
+                raise ResourcePressureError('host commit reserve')
+
+        with self.assertRaises(ResourcePressureError):
+            module.evaluate_suite(policy, model_name='history', stages=(1,),
+                                  seeds=(101,), max_frames=12, resource_check=check)
+        self.assertEqual(policy.calls, 1)
+        self.assertTrue(policy.policy.training)
+        self.assert_rng(saved)
+
     def test_real_native_terminal_counters_and_history_are_not_autoreset_values(self):
         module = self.module()
         raw = module.RustEpisode(stage_ram(1)[None], stage=1, max_frames=4)

@@ -16,6 +16,8 @@ import rust_learning as learning
 import rust_env
 import rust_train
 import rust_validation
+import rust_resources
+from test_rust_resources import healthy_host
 
 
 def suite(wins=0, skill=0.0):
@@ -55,6 +57,7 @@ class LearningTests(unittest.TestCase):
         self.directory.mkdir()
         self.addCleanup(shutil.rmtree, self.directory)
         self.addCleanup(self.assert_native_imports_restored)
+        self.enterContext(patch.object(rust_resources, 'host_snapshot', side_effect=healthy_host))
 
     def config(self, **kwargs):
         return learning.TrialConfig(output=str(self.directory / 'trial'), steps=16,
@@ -120,6 +123,158 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(learning.read_status(self.directory, 'batch')['step'], 8)
         self.assertEqual(len(list(self.directory.glob('batch-*.json'))), 2)
         self.assertFalse(list(self.directory.glob('*.pending')))
+
+    def test_status_and_result_writes_do_not_materialize_whole_json_strings(self):
+        payload = {'episodes': [{'step': i, 'kills': i % 3} for i in range(2000)]}
+        with patch.object(learning.json, 'dumps', side_effect=MemoryError('whole-document encoding')):
+            writer = learning.StatusWriter(self.directory)
+            writer.write(payload)
+            writer.write(payload)
+            learning._write_new(self.directory / 'result.json', payload)
+        self.assertEqual(learning.read_status(self.directory), payload)
+        self.assertEqual(json.loads((self.directory / 'result.json').read_text()), payload)
+        self.assertEqual(len(list(self.directory.glob('status-*.json'))), 1)
+
+    def test_loop_failure_preserves_traceback_without_saving_partial_weights(self):
+        runtime = FixtureRuntime()
+
+        def failed_update(deadline):
+            runtime.collected_steps = 2
+            raise MemoryError('allocation failed in rollout')
+
+        runtime.update = failed_update
+        report = learning.run_training_loop(
+            runtime, self.config(), evaluate=lambda *a, **k: suite(),
+            save=lambda role, step: {'path': role, 'step': step}, publish=lambda _: None)
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['optimized_steps'], 0)
+        self.assertEqual(report['collected_steps'], 2)
+        self.assertIn('failed_update', report.get('traceback', ''))
+        self.assertNotIn('final', report)
+
+    def test_resource_stop_is_incomplete_and_keeps_last_checkpoint_not_partial_weights(self):
+        from rust_resources import ResourcePressureError
+        runtime = FixtureRuntime()
+
+        def failed_update(deadline):
+            runtime.collected_steps = 2
+            raise ResourcePressureError('host commit reserve reached')
+
+        runtime.update = failed_update
+        report = learning.run_training_loop(
+            runtime, self.config(), evaluate=lambda *a, **k: suite(),
+            save=lambda role, step: {'path': role, 'step': step}, publish=lambda _: None)
+        self.assertEqual(report['status'], 'incomplete')
+        self.assertEqual(report['stop_reason'], 'resource_pressure')
+        self.assertEqual(report['collected_steps'], 2)
+        self.assertEqual(report['optimized_steps'], 0)
+        self.assertEqual(report['latest']['step'], 0)
+        self.assertNotIn('final', report)
+        self.assertFalse(report['learning_effect_valid'])
+
+    def test_low_memory_trial_does_not_allocate_model_and_writes_failure_evidence(self):
+        host = healthy_host()
+        host['commit_available_bytes'] = 1024**3
+        config = self.config()
+        with patch.object(rust_resources, 'host_snapshot', return_value=host), \
+                patch.object(learning, 'TrainingRuntime', side_effect=AssertionError('allocated model')):
+            report = learning.run_trial(config, {'stages': [1, 2]})
+        self.assertEqual(report['stop_reason'], 'resource_pressure')
+        self.assertEqual(report['status'], 'incomplete')
+        self.assertEqual(report['collected_steps'], 0)
+        failure = json.loads((Path(config.output) / 'failure.json').read_text())
+        self.assertIn('ResourcePressureError', failure['traceback'])
+        self.assertEqual(failure['resources']['commit_available_bytes'], 1024**3)
+        self.assertFalse(list(Path(config.output).glob('*.zip')))
+
+    def test_pressure_during_real_rollout_keeps_collected_distinct_from_optimized(self):
+        import numpy as np
+        original_check = rust_resources.ResourceMonitor.check
+
+        def check(monitor, phase, **kwargs):
+            if phase == 'rollout':
+                raise rust_resources.ResourcePressureError('fixture host pressure')
+            return original_check(monitor, phase, **kwargs)
+
+        config = self.config()
+        with patch('rust_env.RustVectorEnv', side_effect=fixture_vec), \
+                patch.object(learning, 'verify_frozen', return_value=np.zeros((2, 2048), np.uint8)), \
+                patch('rust_validation.evaluate_suite', return_value=suite()), \
+                patch.object(rust_resources.ResourceMonitor, 'check', check):
+            report = learning.run_trial(config, {'stages': [1, 2]})
+        self.assertEqual(report['stop_reason'], 'resource_pressure')
+        self.assertEqual(report['collected_steps'], 2)
+        self.assertEqual(report['optimized_steps'], 0)
+        self.assertEqual(report['latest']['step'], 0)
+        self.assertNotIn('final', report)
+        self.assertTrue((Path(config.output) / 'failure.json').is_file())
+
+    def test_result_markdown_also_streams_instead_of_materializing_nested_json(self):
+        path = self.directory / 'RESULTS.md'
+        with patch.object(learning.json, 'dumps', side_effect=MemoryError('whole-document encoding')):
+            learning.write_results(path, [{'status': 'failed', 'error': 'fixture',
+                                          'progress': {'samples': list(range(1000))}}])
+        self.assertIn('Error: fixture', path.read_text())
+        self.assertIn('999', path.read_text())
+
+    def test_trial_monitor_failure_does_not_reload_large_json_under_memory_pressure(self):
+        import numpy as np
+
+        class FailedOnceWriter(learning.StatusWriter):
+            failed = False
+
+            def write(self, status):
+                if status.get('phase') == 'finished' and not self.failed:
+                    self.failed = True
+                    raise MemoryError('final monitor allocation')
+                return super().write(status)
+
+        config = self.config()
+        with patch('rust_env.RustVectorEnv', side_effect=fixture_vec), \
+                patch.object(learning, 'verify_frozen', return_value=np.zeros((2, 2048), np.uint8)), \
+                patch('rust_validation.evaluate_suite', return_value=suite()), \
+                patch.object(learning, 'StatusWriter', FailedOnceWriter), \
+                patch.object(learning, 'read_status', side_effect=AssertionError('reloaded large JSON')):
+            report = learning.run_trial(config, {'stages': [1, 2]})
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['optimized_steps'], 16)
+        self.assertIn('MemoryError', report['traceback'])
+        self.assertTrue((Path(config.output) / 'failure.json').is_file())
+
+    def test_supervisor_memory_error_has_small_durable_failure_and_cleans_children(self):
+        record = {'path': '0', 'output': str(self.directory / 'trial'), 'model': 'cnn', 'seed': 0}
+        manifest = {'trials': [record], 'provenance': {}, 'total_step_cap': 16}
+        original_popen = subprocess.Popen
+        processes = []
+
+        def spawn(command, **kwargs):
+            if len(command) < 2 or command[1] != str(learning.ROOT / 'rust_train.py'):
+                return original_popen(command, **kwargs)
+            process = original_popen([sys.executable, '-c', 'import time;time.sleep(120)'], **kwargs)
+            processes.append(process)
+            return process
+
+        class FailedWriter(learning.StatusWriter):
+            def write(self, status):
+                if self.name == 'batch' and status['status'] == 'running':
+                    raise MemoryError('monitor serialization failed')
+                return super().write(status)
+
+        args = SimpleNamespace(output=self.directory, parallel=1, max_wall_seconds=30)
+        with patch.object(learning, 'prepare_study', return_value=manifest), \
+                patch.object(learning, 'verify_frozen'), \
+                patch.object(learning.subprocess, 'Popen', side_effect=spawn), \
+                patch.object(learning, 'StatusWriter', FailedWriter):
+            with self.assertRaises(MemoryError):
+                learning.study(args)
+        self.assertTrue(all(p.poll() is not None for p in processes))
+        path = self.directory / 'supervisor-failure.json'
+        self.assertTrue(path.is_file(), 'failure evidence must survive the failed normal monitor')
+        report = json.loads(path.read_text())
+        self.assertIn('MemoryError', report['traceback'])
+        self.assertFalse(report['automatic_retry'])
+        self.assertFalse(report['exposure_exact'])
+        self.assertLess(path.stat().st_size, 16384)
 
     def test_snapshot_is_not_published_until_payload_is_fsynced(self):
         original_fsync = learning.os.fsync

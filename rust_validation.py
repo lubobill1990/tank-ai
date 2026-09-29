@@ -302,15 +302,19 @@ def _ratio(numerator, denominator):
     return numerator / denominator if denominator else None
 
 
-def play_episode(raw, *, model, nstack, deterministic, seed, deadline=None):
+def play_episode(raw, *, model, nstack, deterministic, seed, deadline=None, resource_check=None):
     """Run one real episode; no timeout/deadline can be converted into success."""
     _check_deadline(deadline)
+    if resource_check is not None:
+        resource_check()
     _seed_episode(seed)
     player = EpisodePlayer(raw, model=model, nstack=nstack, deterministic=deterministic,
                            deadline=deadline)
     player.reset(seed)
     diagnostics, total_reward = _Diagnostics(), 0.0
     for decision in range(1, raw.max_frames + 1):
+        if resource_check is not None:
+            resource_check()
         before = raw.state
         reward, done, info = player.step()
         _check_deadline(deadline)
@@ -405,7 +409,7 @@ def _validate_inputs(model, model_name, stages, seeds, max_frames, deadline):
 
 
 def evaluate_suite(model, *, model_name, stages=(4, 5), seeds=(101, 202),
-                   max_frames=12000, deadline=None):
+                   max_frames=12000, deadline=None, resource_check=None):
     """Evaluate both modes on native full games, independent ROM games and skills.
 
     ``deadline`` is an absolute ``time.monotonic()`` time. Partial evaluations
@@ -416,6 +420,8 @@ def evaluate_suite(model, *, model_name, stages=(4, 5), seeds=(101, 202),
     with _evaluation_state(model):
         spec = _validate_inputs(model, model_name, stages, seeds, max_frames, deadline)
         _check_deadline(deadline)
+        if resource_check is not None:
+            resource_check()
         nstack = spec["n_stack"]
         raw_results = {backend: {mode: [] for mode in MODES} for backend in ("rust", "rom", "skills")}
         for stage in stages:
@@ -426,7 +432,7 @@ def evaluate_suite(model, *, model_name, stages=(4, 5), seeds=(101, 202),
                     for seed in seeds:
                         raw_results["rust"][mode].append(play_episode(
                             rust, model=model, nstack=nstack, deterministic=mode == "deterministic",
-                            seed=seed, deadline=deadline))
+                            seed=seed, deadline=deadline, resource_check=resource_check))
             finally:
                 rust.close()
             _check_deadline(deadline)
@@ -438,7 +444,7 @@ def evaluate_suite(model, *, model_name, stages=(4, 5), seeds=(101, 202),
                     for seed in seeds:
                         raw_results["rom"][mode].append(play_episode(
                             rom, model=model, nstack=nstack, deterministic=mode == "deterministic",
-                            seed=seed, deadline=deadline))
+                            seed=seed, deadline=deadline, resource_check=resource_check))
             finally:
                 rom.close()
         skill_frames = min(SKILL_FRAMES, max_frames)
@@ -452,7 +458,7 @@ def evaluate_suite(model, *, model_name, stages=(4, 5), seeds=(101, 202),
                         for seed in seeds:
                             raw_results["skills"][mode].append(play_episode(
                                 raw, model=model, nstack=nstack, deterministic=mode == "deterministic",
-                                seed=seed, deadline=deadline))
+                                seed=seed, deadline=deadline, resource_check=resource_check))
                 finally:
                     raw.close()
         result = {
