@@ -14,6 +14,55 @@ from rust_train import contract, parse_args, train, evaluate_rom, validate_manif
 
 
 class RustTrainingTests(unittest.TestCase):
+    def test_study_commands_dispatch_without_changing_performance_commands(self):
+        from unittest.mock import patch
+        from rust_train import main
+        with patch('rust_learning.main', return_value=0) as monitored:
+            self.assertEqual(main(['study', '--output', 'unused']), 0)
+            monitored.assert_called_once_with(['study', '--output', 'unused'])
+
+    def test_sixteen_frame_history_keeps_terminal_data_out_of_the_reset_episode(self):
+        from native_rollout import NativeRunRolloutBuffer
+        from sb3_contrib.common.maskable.buffers import MaskableRolloutBuffer
+        import torch
+        initial = np.stack([stage_ram(1), stage_ram(2)])
+        env = VecFrameStack(RustVectorEnv(initial, 8), n_stack=16, channels_order='first')
+        try:
+            compact = NativeRunRolloutBuffer(4, env.observation_space, env.action_space,
+                                            device='cpu', n_envs=2, channels_per_frame=47)
+            dense = MaskableRolloutBuffer(4, env.observation_space, env.action_space,
+                                         device='cpu', n_envs=2)
+            obs = env.reset()
+            np.testing.assert_array_equal(obs[:, :-47], 0)
+            starts = np.ones(2, dtype=bool)
+            for step in range(4):
+                actions = np.array([5, 0])
+                masks = np.stack(env.env_method('action_masks'))
+                next_obs, rewards, dones, infos = env.step(actions)
+                for buffer in (compact, dense):
+                    buffer.add(obs, actions, rewards, starts, torch.zeros(2),
+                               torch.zeros(2), action_masks=masks)
+                if dones.any():
+                    for index in np.flatnonzero(dones):
+                        np.testing.assert_array_equal(next_obs[index, :-47], 0)
+                        terminal = infos[index]['terminal_observation']
+                        np.testing.assert_array_equal(terminal[:-47], obs[index, 47:])
+                        self.assertEqual(terminal.shape, (16 * 47, 26, 26))
+                obs, starts = next_obs, dones
+            for buffer in (compact, dense):
+                buffer.compute_returns_and_advantage(torch.zeros(2), starts)
+            np.random.seed(42)
+            expected = list(dense.get(batch_size=2))
+            np.random.seed(42)
+            actual = list(compact.get(batch_size=2))
+            for left, right in zip(expected, actual):
+                for field in left._fields:
+                    torch.testing.assert_close(getattr(left, field), getattr(right, field),
+                                               rtol=0, atol=0)
+            self.assertLess(compact.storage_nbytes, dense.observations.nbytes)
+        finally:
+            env.close()
+
     def test_budget_requires_complete_rollouts(self):
         with self.assertRaises(SystemExit):
             parse_args(['train', '--output', 'unused', '--steps', '65',

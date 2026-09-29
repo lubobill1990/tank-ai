@@ -59,6 +59,78 @@ experimental. Unknown terrain, P2 and unsupported stage continuation retain
 hard errors. Legacy mode retains its original restrictive parity flags.
 The Python training binding rejects a `reference-rng` diagnostic DLL.
 
+## Monitored learning study
+
+The `study` command is separate from the short `train`/`compare` storage
+acceptance commands below. It compares three fresh primitive-action policies:
+
+| Model | Input history | Feature extractor parameters |
+| --- | --- | ---: |
+| `cnn` | 2 decision observations | 2,851,680 |
+| `spatial` | 2 observations, 169 positioned spatial tokens | 199,264 |
+| `history` | 16 raw observations, causal temporal attention | 222,656 |
+
+The historical model has a finite window of about one second, not unbounded
+recurrent memory. It encodes every raw frame during PPO replay, never reuses
+stale embeddings after a parameter update, and cannot attend to a future frame.
+Prefix padding is masked safely; episode resets clear history, while terminal
+observations retain the preceding history for timeout value bootstrapping.
+Its fixed 13-to-3 spatial average-pooling bins support deterministic CUDA
+backpropagation; this is not a request to relax Torch determinism.
+
+```powershell
+uv run --no-sync python rust_train.py study `
+  --output runs\rust-monitored-study `
+  --models cnn,spatial,history --seeds 0,1 `
+  --steps 262144 --checkpoint-every 16384 --eval-every 65536 `
+  --envs 32 --n-steps 256 --batch-size 256 --epochs 4 `
+  --codec cuda --device cuda --parallel 2 `
+  --stages 1,2,3 --eval-stages 4,5 --eval-seeds 101,202 `
+  --confirm-stages 6,7 --confirm-seeds 1001,2002 `
+  --max-frames 12000 --max-wall-seconds 3600 --patience 3
+```
+
+This requests six trials with a total cap of **1,572,864 transitions**. Each
+trial uses LR 0.00005, target KL 0.01, gamma 0.99, the same sparse reward, and fresh
+weights/optimizer. No fifteen-action checkpoint is silently loaded.
+At most two trials run together; elapsed time is shared-resource timing, not an
+isolated model speed benchmark.
+
+Checkpoints are saved only after optimizer updates, every 16,384 transitions.
+Initial and every 65,536-step validation separately report:
+
+- Rust full-stage outcomes under its independent seeded PRNG;
+- original-ROM full-stage outcomes, with the full **12,000-frame** allowance;
+- original-ROM shooting, dodging, countering, demolition, pickup and defense
+  skill success. Controlled skills retain their 600-frame diagnostic cap and
+  never count as full-stage wins.
+
+All three evaluation surfaces accept exactly ten primitive actions and derive
+their 2/16-frame history from the checkpoint's model contract. Evaluation restores
+training RNG state and policy mode. Unavailable-fire and stationary-action
+diagnostics are decision-boundary measurements, not claims about authoritative
+per-frame shot events. The existing ROM observer caveats still apply.
+
+`best` is selected by deterministic ROM wins, then mean ROM skill success.
+Confirmation on stages 6/7 never selects checkpoints. Rust return or survival
+alone cannot qualify a model as improving in the cartridge.
+
+Stop conditions are the exact transition cap, one-hour whole-trial wall cap,
+three completed validation checks without improvement, or an explicit runtime/
+nonfinite failure. Incomplete evaluations remain incomplete and cannot be
+presented as successes; no trial automatically extends its budget.
+
+Each checkpoint has its own versioned manifest with model/history/action
+contract, Python/native/library/ROM hashes, initial stage RAM hashes, seeds,
+optimizer-update count and optimized steps. They are evaluation checkpoints,
+not exact simulator/RNG resume snapshots. Existing performance manifests and
+the production fifteen-action manifests are separate formats.
+
+Monitoring uses immutable durable status records; a sharing-locked Windows
+display pointer must not terminate otherwise healthy training. Read authoritative
+status through `rust_learning.read_status`. All completed trial/checkpoint and
+validation records are retained, including unsuccessful or stopped trials.
+
 Sparse reward is +1 per kill, -3 per death, -20 for base loss, +5 for clear and
 -0.0005 per logical frame. Episodes span multiple lives, ending at base loss,
 final-life death, clear or timeout; a timeout is truncated, not a failure.

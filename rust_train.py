@@ -1,4 +1,8 @@
-"""Bounded experimental Rust training, storage comparisons and original-ROM transfer."""
+"""Experimental Rust backend: train/compare/eval acceptance commands.
+
+Use ``study`` for bounded CNN/spatial/history learning with periodic original-ROM
+validation, or ``learn`` for an explicitly prepared single-trial configuration.
+"""
 import argparse
 import ctypes as ct
 import hashlib
@@ -332,9 +336,15 @@ def compare(args):
 
 
 def main(argv=None):
-    args = parse_args(argv)
-    {'train': train, 'eval': evaluate_rom, 'compare': compare}[args.command](args)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in ('study', 'learn'):
+        from rust_learning import main as learning_main
+        return learning_main(arguments)
+    args = parse_args(arguments)
+    return {'train': train, 'eval': evaluate_rom, 'compare': compare}[args.command](args)
 
 
 if __name__ == '__main__':
-    main()
+    result = main()
+    if isinstance(result, int):
+        raise SystemExit(result)

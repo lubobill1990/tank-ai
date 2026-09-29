@@ -1,5 +1,22 @@
 # Tank AI：26×26 坦克大战
 
+## 新入口：Rust 批量学习与真实 ROM 周期验收
+
+`rust_train.py study` 用实验性 Rust 引擎训练 CNN、空间 Transformer 和16步历史
+Transformer，并定期回真实 ROM 做完整关卡和技能评测。默认三种模型各两个种子，
+每次最多262,144步，每65,536步验收，每16,384步保存 checkpoint，最多两组并行。
+完整关卡验收保留12,000帧上限；不会把性能测试用的600帧时长当作正式效果评测。
+
+```powershell
+uv run --no-sync python rust_train.py study --output runs\rust-monitored-study `
+  --models cnn,spatial,history --seeds 0,1 --device cuda --codec cuda --parallel 2
+```
+
+此路线保持10个原始动作和独立 seeded PRNG，**不宣称与 ROM 随机流等效**；
+原有15动作路线及旧实验输出不改。所有权重从零训练，不静默转换旧模型。
+有验收改善才考虑额外预算，无改善按门槛停止。
+模型、历史、内存、评测、停训与签名细则见 [Rust 后端说明](docs/rust_backend.md)。
+
 ## 当前工作方式：先验收，再训练
 
 约 1046 万步的长实验已暂停，保留在 `runs/20260928-boundary-continue347136-g099/`。
