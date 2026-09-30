@@ -170,9 +170,16 @@ class MpcVetoTeacher:
         return actions
 
 
+def load_student(path, device):
+    """Student policy for DAgger-style execution; teacher still labels."""
+    from sb3_contrib import MaskablePPO
+    return MaskablePPO.load(path, device=device,
+                            custom_objects={'n_steps': 2, 'n_envs': 1, 'batch_size': 2})
+
+
 def collect(stage, *, episodes, envs, output, base_seed, depth, plan_seeds,
             noise, max_frames, deadline=None, threat_weight=6.0, quiet=False,
-            guard=False):
+            guard=False, student=None, student_device='cpu', beta=0.0):
     """Run the MPC teacher on one stage; each env appends to its own stream."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -180,12 +187,15 @@ def collect(stage, *, episodes, envs, output, base_seed, depth, plan_seeds,
     initial = np.stack([ram0] * envs)
     batch = NativeBatch(initial, max_frames,
                         seeds=[episode_seed(base_seed, i, 0) for i in range(envs)])
+    batch.observe()  # np.empty buffer holds garbage until the first native fill
     planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
                              threat_weight=threat_weight,
                              plan_rng_seed=base_seed * 1000003 + stage)
     noise_rng = np.random.default_rng(base_seed * 9176 + stage)
     teacher_class = GuardedTeacher if guard else TeacherControllerV2
     teachers = [teacher_class() for _ in range(envs)]
+    policy = load_student(student, student_device) if student else None
+    previous_obs = np.zeros((envs, 47, 26, 26), np.float32) if policy is not None else None
     parsers = [CachedParser() for _ in range(envs)]
     writers, reports, counters = [], [], []
     for i in range(envs):
@@ -210,18 +220,28 @@ def collect(stage, *, episodes, envs, output, base_seed, depth, plan_seeds,
             proposals = [teachers[i].act(states[k], col_masks[i]) for k, i in enumerate(live)]
             scores, unsafe = planner.plan(np.stack(rams))
             chosen = planner.choose(scores, unsafe, [col_masks[i] for i in live], proposals)
+            obs_now = batch.obs.copy()
+            student_actions = None
+            if policy is not None:
+                stacked = np.concatenate([previous_obs, obs_now], axis=1)
+                sampled, _ = policy.predict(stacked, deterministic=False,
+                                            action_masks=col_masks)
+                student_actions = sampled
+                previous_obs[list(live)] = obs_now[list(live)]
             actions = np.zeros(envs, np.int64)
             executed = {}
             for k, i in enumerate(live):
                 act = int(chosen[k])
                 run = act
-                if noise > 0 and noise_rng.random() < noise:
+                if student_actions is not None and noise_rng.random() >= beta:
+                    run = int(student_actions[i])
+                elif noise > 0 and noise_rng.random() < noise:
                     options = np.flatnonzero(col_masks[i] & ~unsafe[k])
                     if len(options) > 1:
                         run = int(noise_rng.choice(options))
                 actions[i] = run
                 executed[i] = (act, run)
-            obs_before = batch.obs.copy()
+            obs_before = obs_now
             obs, rewards, dones, stats = batch.step(actions)
             for k, i in enumerate(live):
                 teach, run = executed[i]
@@ -246,6 +266,8 @@ def collect(stage, *, episodes, envs, output, base_seed, depth, plan_seeds,
                     if remaining >= sum(episode_active):
                         batch.reset(i, seed=episode_seed(base_seed, i, episode_index[i]))
                         teachers[i].reset()
+                        if previous_obs is not None:
+                            previous_obs[i] = 0
                         pending_start[i] = True
                     else:
                         episode_active[i] = False
@@ -307,12 +329,17 @@ def main(argv=None):
     parser.add_argument('--max-frames', type=int, default=12000)
     parser.add_argument('--max-seconds', type=float, default=None)
     parser.add_argument('--guard', action='store_true')
+    parser.add_argument('--student', type=Path, default=None)
+    parser.add_argument('--student-device', default='cpu')
+    parser.add_argument('--beta', type=float, default=0.0,
+                        help='probability of executing the teacher action in DAgger mode')
     args = parser.parse_args(argv)
     deadline = time.perf_counter() + args.max_seconds if args.max_seconds else None
     collect(args.stage, episodes=args.episodes, envs=args.envs, output=args.output,
             base_seed=args.base_seed, depth=args.depth, plan_seeds=args.plan_seeds,
             noise=args.noise, max_frames=args.max_frames, deadline=deadline,
-            threat_weight=args.threat_weight, guard=args.guard)
+            threat_weight=args.threat_weight, guard=args.guard, student=args.student,
+            student_device=args.student_device, beta=args.beta)
 
 
 if __name__ == '__main__':

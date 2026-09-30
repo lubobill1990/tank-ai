@@ -16,8 +16,11 @@ def run_stage(stage, args):
         summary = json.loads((output / 'summary.json').read_text(encoding='utf-8'))
         print(f'stage {stage:02d}: cached clear_rate={summary["clear_rate"]:.2f}', flush=True)
         return stage, summary
+    episodes = args.episodes
+    if getattr(args, 'episodes_by_stage', None):
+        episodes = args.episodes_by_stage.get(str(stage), args.episodes)
     command = [sys.executable, str(ROOT / 'mpc_teacher.py'),
-               '--stage', str(stage), '--episodes', str(args.episodes),
+               '--stage', str(stage), '--episodes', str(episodes),
                '--envs', str(args.envs), '--output', str(output),
                '--base-seed', str(args.base_seed + stage),
                '--depth', str(args.depth), '--plan-seeds', str(args.plan_seeds),
@@ -26,6 +29,9 @@ def run_stage(stage, args):
         command += ['--max-seconds', str(args.max_seconds)]
     if args.guard:
         command.append('--guard')
+    if args.student:
+        command += ['--student', str(args.student), '--student-device',
+                    args.student_device, '--beta', str(args.beta)]
     start = time.perf_counter()
     proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     if proc.returncode:
@@ -52,7 +58,13 @@ def main():
     parser.add_argument('--workers', type=int, default=12)
     parser.add_argument('--max-seconds', type=float, default=None)
     parser.add_argument('--guard', action='store_true')
+    parser.add_argument('--student', type=Path, default=None)
+    parser.add_argument('--student-device', default='cpu')
+    parser.add_argument('--beta', type=float, default=0.0)
+    parser.add_argument('--episodes-map', default=None,
+                        help='JSON mapping stage->episode count overriding --episodes')
     args = parser.parse_args()
+    args.episodes_by_stage = json.loads(args.episodes_map) if args.episodes_map else None
     stages = []
     for part in args.stages.split(','):
         if '-' in part:
