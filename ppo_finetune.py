@@ -31,20 +31,62 @@ def parse_stages(text):
     return stages
 
 
+def make_shaped_env(initial, max_frames, seed, weights):
+    """RustVectorEnv with rewards rebuilt from per-step native stat deltas.
+
+    The native scalar reward is replaced by
+    kill_w * new_kills - death_w * new_deaths - base_w * base_loss
+    + clear_w * clear - frame_cost per decision, computed from the engine's
+    cumulative kill/death counters and episode outcomes.
+    """
+    from rust_env import RustVectorEnv
+
+    class ShapedRustVectorEnv(RustVectorEnv):
+        def __init__(self):
+            super().__init__(initial, max_frames, seed=seed)
+            n = self.num_envs
+            self._prev_stats = np.zeros((n, 5), np.float64)
+
+        def step_wait(self):
+            obs, _, dones, infos = super().step_wait()
+            stats = self.batch.stats.astype(np.float64)
+            delta = stats - self._prev_stats
+            rewards = (weights['kill'] * delta[:, 1]
+                       - weights['death'] * delta[:, 2]
+                       - weights['frame'] * 4.0)
+            for index, info in enumerate(infos):
+                outcome = info.get('outcome')
+                if outcome == 'clear':
+                    rewards[index] += weights['clear']
+                elif outcome == 'base_lost':
+                    rewards[index] -= weights['base']
+                elif outcome == 'lives_exhausted':
+                    rewards[index] -= weights['final_death']
+                if outcome is not None:
+                    self._prev_stats[index] = 0.0
+                else:
+                    self._prev_stats[index] = stats[index]
+            return obs, rewards.astype(np.float32), dones, infos
+
+    return ShapedRustVectorEnv()
+
+
 class OutcomeLog:
     def __init__(self):
         self.window = []
 
     def push(self, info):
-        self.window.append(info['outcome'])
+        self.window.append((info['outcome'], info.get('kills', 0)))
         if len(self.window) > 400:
             self.window.pop(0)
 
     def rates(self):
         if not self.window:
             return {}
-        return {k: self.window.count(k) / len(self.window)
-                for k in set(self.window)}
+        outcomes = [o for o, _ in self.window]
+        summary = {k: outcomes.count(k) / len(outcomes) for k in set(outcomes)}
+        summary['kills_mean'] = float(np.mean([k for _, k in self.window]))
+        return summary
 
 
 def main(argv=None):
@@ -69,6 +111,14 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--freeze-extractor', action='store_true')
+    parser.add_argument('--shaped', action='store_true',
+                        help='replace native sparse reward with kill-forward shaping')
+    parser.add_argument('--kill-w', type=float, default=2.0)
+    parser.add_argument('--death-w', type=float, default=1.0)
+    parser.add_argument('--base-w', type=float, default=20.0)
+    parser.add_argument('--clear-w', type=float, default=20.0)
+    parser.add_argument('--final-death-w', type=float, default=3.0)
+    parser.add_argument('--frame-w', type=float, default=0.0005)
     parser.add_argument('--max-frames', type=int, default=12000)
     parser.add_argument('--checkpoint-every', type=int, default=71680)
     args = parser.parse_args(argv)
@@ -94,8 +144,14 @@ def main(argv=None):
     assignment = [pool[i % len(pool)] for i in range(args.envs)]
     rams = {stage: stage_ram(stage, seed=0) for stage in sorted(set(assignment))}
     initial = np.stack([rams[stage] for stage in assignment])
-    vec = VecFrameStack(RustVectorEnv(initial, args.max_frames, seed=args.seed),
-                        n_stack=2, channels_order='first')
+    if args.shaped:
+        weights = {'kill': args.kill_w, 'death': args.death_w, 'base': args.base_w,
+                   'clear': args.clear_w, 'final_death': args.final_death_w,
+                   'frame': args.frame_w}
+        base_env = make_shaped_env(initial, args.max_frames, args.seed, weights)
+    else:
+        base_env = RustVectorEnv(initial, args.max_frames, seed=args.seed)
+    vec = VecFrameStack(base_env, n_stack=2, channels_order='first')
 
     buffer_kwargs = {'channels_per_frame': 47, 'max_storage_bytes': 2 << 30}
     model = MaskablePPO.load(
