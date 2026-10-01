@@ -150,7 +150,7 @@ class Commander:
         self.calls = 0
         self.log = open(log_path, 'a', encoding='utf-8')
 
-    def order(self, state_text):
+    def order(self, state_text, state=None):
         payload = {
             'model': self.model, 'max_tokens': 300, 'temperature': 0.2,
             'system': [{'type': 'text', 'text': SYSTEM_PROMPT,

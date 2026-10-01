@@ -24,8 +24,36 @@ if str(ROOT) not in sys.path:
 
 import game_state as gs
 from heuristic import HeuristicBot
+from learning_lab.demonstrations import DemonstrationWriter
 from llm_player import Commander, execute_order, render_state
 from mpc_teacher import CachedParser, MpcVetoTeacher
+
+BASE_X, BASE_Y = 120, 216
+
+
+def strategy_features(state):
+    """Compact numeric summary of a decision state for strategist training."""
+    player = state.player
+    features = {
+        'player': None if player is None else
+            [*player.tile, int(player.facing), int(player.power)],
+        'lives': int(state.lives), 'remaining': int(state.remaining_enemies),
+        'spawn_left': int(state.spawn_left), 'kills': int(state.kills),
+        'fire_ready': bool(state.fire_ready), 'freeze': bool(state.freeze),
+        'shield': bool(state.shield),
+        'enemy_bullets': sum(b.owner >= 2 for b in state.bullets),
+        'item': None if state.item is None else
+            [int((state.item.y - gs.ARENA) // gs.CELL),
+             int((state.item.x - gs.ARENA) // gs.CELL), int(state.item.kind)],
+        'enemies': [[*e.tile, int(e.facing), int(e.armor), int(e.drops_item)]
+                    for e in state.enemies],
+    }
+    if player is not None:
+        features['player_base_dist'] = abs(player.x - BASE_X) + abs(player.y - BASE_Y)
+    if state.enemies:
+        features['enemy_base_dist'] = min(
+            abs(e.x - BASE_X) + abs(e.y - BASE_Y) for e in state.enemies)
+    return features
 
 
 class EpisodeVideo:
@@ -53,7 +81,7 @@ class EpisodeVideo:
 def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                      llm_every=30, max_calls=80, max_frames=12000,
                      depth=12, plan_seeds=3, use_veto=True,
-                     initial_mode='hunt'):
+                     initial_mode='hunt', record_demos=False, record_video=True):
     from stable_baselines3.common.utils import set_random_seed
     from rust_train import ROMPrimitiveEnv
     planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
@@ -68,13 +96,19 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
     decisions_since_call = llm_every
     outcome, info = 'unfinished', {}
     partial = Path(output_dir) / f'.partial-{episode_tag}.mp4'
-    video = EpisodeVideo(partial)
+    video = EpisodeVideo(partial) if record_video else None
+    writer = None
+    if record_demos:
+        writer = DemonstrationWriter(Path(output_dir) / 'demos' / episode_tag)
+    strategy_rows = []
     veto_failures = 0
     started = time.perf_counter()
     try:
         set_random_seed(seed)
-        env.reset(seed=seed)
-        video.write(raw.nes.screen)
+        observation, _ = env.reset(seed=seed)
+        if video is not None:
+            video.write(raw.nes.screen)
+        episode_start = True
         for step in range(max_frames // 4 + 4):
             ram = np.array(raw.nes.ram, dtype=np.uint8, copy=True)
             state = parser.parse(ram)
@@ -95,7 +129,10 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
             if decisions_since_call >= llm_every and commander.calls < max_calls \
                     and commander.cost < commander.budget and state.player is not None:
                 text = render_state(state, stage, step * 4, events, order['mode'])
-                order, _ = commander.order(text)
+                order, _ = commander.order(text, state=state)
+                strategy_rows.append({'frame': step * 4, 'stage': stage,
+                                      'features': strategy_features(state),
+                                      'order': order})
                 events = []
                 decisions_since_call = 0
             decisions_since_call += 1
@@ -109,16 +146,40 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                     action = int(planner.choose(scores, unsafe, [masks], [action])[0])
                 except Exception:
                     veto_failures += 1
-            _, _, terminated, truncated, step_info = env.step(int(action))
-            video.write(raw.nes.screen)
+            if writer is not None:
+                writer.add(np.asarray(observation, np.float32), int(action),
+                           masks, episode_start=episode_start,
+                           executed_action=int(action))
+                episode_start = False
+            observation, _, terminated, truncated, step_info = env.step(int(action))
+            if video is not None:
+                video.write(raw.nes.screen)
             if terminated or truncated:
                 info = step_info
                 outcome = step_info.get('outcome', 'unknown')
                 break
     finally:
-        video.close()
-    final = Path(output_dir) / f'{episode_tag}-{outcome}.mp4'
-    partial.replace(final)
+        if video is not None:
+            video.close()
+    if writer is not None:
+        writer.finish([{'episode_id': 0, 'outcome': outcome, 'stage': stage,
+                        'kills': info.get('kills'), 'deaths': info.get('deaths'),
+                        'frames': info.get('frames'), 'seed': seed}],
+                      {'collector': 'llm-commander-rom-v1', 'stage': stage,
+                       'stream': 0, 'base_seed': seed, 'model': commander.model,
+                       'initial_mode': initial_mode, 'llm_every': llm_every,
+                       'noise': 0.0, 'beta': 1.0,
+                       'backend': 'original-rom-llm-commander'})
+    if strategy_rows:
+        with (Path(output_dir) / 'strategy.jsonl').open('a', encoding='utf-8') as f:
+            for row in strategy_rows:
+                row['outcome'] = outcome
+                f.write(json.dumps(row) + '\n')
+    if video is not None:
+        final = Path(output_dir) / f'{episode_tag}-{outcome}.mp4'
+        partial.replace(final)
+    else:
+        final = None
     env.close()
     return {'stage': stage, 'seed': seed, 'outcome': outcome,
             'kills': info.get('kills'), 'deaths': info.get('deaths'),
@@ -126,7 +187,7 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
             'llm_calls': commander.calls, 'cost_usd': round(commander.cost, 4),
             'veto_fallbacks': veto_failures,
             'wall_seconds': round(time.perf_counter() - started, 1),
-            'video': str(final)}
+            'video': None if final is None else str(final)}
 
 
 def main(argv=None):
@@ -144,6 +205,10 @@ def main(argv=None):
     parser.add_argument('--no-veto', action='store_true')
     parser.add_argument('--initial-mode', default='hunt',
                         choices=('hunt', 'protect', 'hold'))
+    parser.add_argument('--record-demos', action='store_true')
+    parser.add_argument('--no-video', action='store_true')
+    parser.add_argument('--strategist', type=Path, default=None,
+                        help='local MLP commander checkpoint instead of the LLM')
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -158,15 +223,22 @@ def main(argv=None):
     results_path = args.output / 'results.jsonl'
     for stage in stages:
         for episode in range(args.episodes):
-            commander = Commander(args.base_url, args.token, args.model,
-                                  args.budget_usd, args.output / 'transcript.jsonl')
+            if args.strategist is not None:
+                from strategist import StrategistCommander
+                commander = StrategistCommander(args.strategist)
+            else:
+                commander = Commander(args.base_url, args.token, args.model,
+                                      args.budget_usd,
+                                      args.output / 'transcript.jsonl')
             result = play_rom_episode(
                 stage, seed=args.base_seed + stage * 100 + episode,
                 commander=commander, output_dir=args.output,
                 episode_tag=f'stage{stage:02d}-ep{episode}{args.tag_suffix}',
                 llm_every=args.llm_every, max_calls=args.max_calls,
-                use_veto=not args.no_veto, initial_mode=args.initial_mode)
-            commander.log.close()
+                use_veto=not args.no_veto, initial_mode=args.initial_mode,
+                record_demos=args.record_demos, record_video=not args.no_video)
+            if hasattr(commander, 'log'):
+                commander.log.close()
             with results_path.open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps(result) + '\n')
             print(json.dumps(result), flush=True)
