@@ -157,22 +157,33 @@ class Commander:
                         'cache_control': {'type': 'ephemeral'}}],
             'messages': [{'role': 'user', 'content': state_text}],
         }
-        request = urllib.request.Request(
-            self.base_url + '/v1/messages', data=json.dumps(payload).encode(),
-            headers={'content-type': 'application/json',
-                     'anthropic-version': ANTHROPIC_VERSION,
-                     'authorization': f'Bearer {self.token}',
-                     'x-api-key': self.token})
+        data = json.dumps(payload).encode()
+        headers = {'content-type': 'application/json',
+                   'anthropic-version': ANTHROPIC_VERSION,
+                   'authorization': f'Bearer {self.token}',
+                   'x-api-key': self.token}
+        url = self.base_url + '/v1/messages'
         last_error = None
-        for attempt in range(3):
+        body = None
+        for attempt in range(6):
             try:
-                with urllib.request.urlopen(request, timeout=120) as response:
+                request = urllib.request.Request(url, data=data, headers=headers)
+                with urllib.request.urlopen(request, timeout=180) as response:
                     body = json.load(response)
                 break
+            except urllib.error.HTTPError as error:
+                last_error = error
+                # devtunnel occasionally answers POSTs with a redirect blip;
+                # follow an absolute Location once, otherwise back off and retry.
+                location = error.headers.get('Location') if error.headers else None
+                if error.code in (301, 302, 307, 308) and location \
+                        and location.startswith('https://'):
+                    url = location
+                time.sleep(8 * (attempt + 1))
             except Exception as error:  # noqa: BLE001 - retry then surface
                 last_error = error
-                time.sleep(5 * (attempt + 1))
-        else:
+                time.sleep(8 * (attempt + 1))
+        if body is None:
             raise RuntimeError(f'LLM call failed after retries: {last_error}')
         usage = body.get('usage', {})
         prices = PRICES.get(self.model, (3.0, 15.0))

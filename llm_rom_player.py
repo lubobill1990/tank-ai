@@ -233,7 +233,7 @@ def main(argv=None):
             result = play_rom_episode(
                 stage, seed=args.base_seed + stage * 100 + episode,
                 commander=commander, output_dir=args.output,
-                episode_tag=f'stage{stage:02d}-ep{episode}{args.tag_suffix}',
+                episode_tag=f'stage{stage:02d}-ep{episode}-s{args.base_seed}{args.tag_suffix}',
                 llm_every=args.llm_every, max_calls=args.max_calls,
                 use_veto=not args.no_veto, initial_mode=args.initial_mode,
                 record_demos=args.record_demos, record_video=not args.no_video)
