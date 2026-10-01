@@ -152,11 +152,13 @@ class Commander:
 
     def order(self, state_text, state=None):
         payload = {
-            'model': self.model, 'max_tokens': 300, 'temperature': 0.2,
+            'model': self.model, 'max_tokens': 300,
             'system': [{'type': 'text', 'text': SYSTEM_PROMPT,
                         'cache_control': {'type': 'ephemeral'}}],
             'messages': [{'role': 'user', 'content': state_text}],
         }
+        if 'opus' not in self.model:
+            payload['temperature'] = 0.2  # the gateway rejects it for opus-5
         data = json.dumps(payload).encode()
         headers = {'content-type': 'application/json',
                    'anthropic-version': ANTHROPIC_VERSION,
