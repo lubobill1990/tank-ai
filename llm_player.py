@@ -57,8 +57,11 @@ automatically dodging bullets and shooting enemies in its line of fire. Orders:
 - {"mode":"hunt"}            chase and destroy the nearest enemies
 - {"mode":"protect"}         fall back and guard the base approaches
 - {"mode":"item"}            grab the power-up item
-- {"mode":"goto","target":[row,col]}  move to that cell, fighting on the way
-- {"mode":"hold"}            stay put, only dodge and return fire
+- {"mode":"goto","target":[row,col]}  move there, then HOLD that cell as a
+  shield, shooting whatever lines up. Use this to body-block the base
+  approaches: the base sits at rows 24-25, cols 12-13, so standing at
+  (23,12), (24,10) or (24,15) physically blocks the usual attack lanes.
+- {"mode":"hold"}            stay put, dodge and shoot anything lined up
 
 Key judgement you are trusted with: when any enemy is closer to the base than
 you are, or several enemies are pushing the bottom half, switch to protect
@@ -208,6 +211,19 @@ class Commander:
         return order
 
 
+def aim_without_moving(bot, state):
+    """Fire at any lined-up enemy from the current position; never chase."""
+    player = state.player
+    if player is None:
+        return 0
+    for enemy in sorted(state.enemies,
+                        key=lambda e: abs(e.x - player.x) + abs(e.y - player.y)):
+        action = bot._aim(state, enemy)
+        if action:
+            return action
+    return 0
+
+
 def execute_order(bot, state, order):
     """Primitive action for the current strategic order; 0 when satisfied."""
     if state.player is None or state.game_over:
@@ -218,7 +234,7 @@ def execute_order(bot, state, order):
             return action
     mode = order['mode']
     if mode == 'hold':
-        return bot.advise('counter', state)
+        return bot.advise('counter', state) or aim_without_moving(bot, state)
     if mode == 'item' and state.item is not None:
         return bot.advise('item', state)
     if mode == 'goto':
@@ -230,7 +246,8 @@ def execute_order(bot, state, order):
         action = bot._navigate('item', state, (x, y))
         if action:
             return action
-        return bot.advise('hunt', state)
+        # Arrived: hold the position as a shield, shooting what approaches.
+        return bot.advise('counter', state) or aim_without_moving(bot, state)
     if mode == 'protect':
         return bot.advise('protect', state)
     return bot.advise('hunt', state)
