@@ -135,7 +135,7 @@ def main(argv=None):
     parser.add_argument('--threads', type=int, default=10)
     parser.add_argument('--initial-checkpoint', type=Path, default=None)
     parser.add_argument('--max-seconds', type=float, default=None)
-    parser.add_argument('--extractor', choices=('cnn', 'ego'), default='cnn')
+    parser.add_argument('--extractor', choices=('cnn', 'ego', 'ego-wide'), default='cnn')
     args = parser.parse_args(argv)
 
     import torch
@@ -144,14 +144,18 @@ def main(argv=None):
 
     def new_ego_model(learning_rate, seed, device):
         from sb3_contrib import MaskablePPO
-        from learning_lab.ego_encoder import EgocentricGridCNN
         from learning_lab.imitation import _OfflineSpaces
+        if args.extractor == 'ego-wide':
+            from ego_wide import EgocentricWideCNN as extractor
+            net_arch = {'pi': [128, 128], 'vf': [128, 128]}
+        else:
+            from learning_lab.ego_encoder import EgocentricGridCNN as extractor
+            net_arch = {'pi': [64, 64], 'vf': [64, 64]}
         return MaskablePPO(
             'CnnPolicy', _OfflineSpaces(), learning_rate=learning_rate, seed=seed,
             device=device, n_steps=2, batch_size=2, n_epochs=1, verbose=0,
-            policy_kwargs={'features_extractor_class': EgocentricGridCNN,
-                           'normalize_images': False,
-                           'net_arch': {'pi': [64, 64], 'vf': [64, 64]}})
+            policy_kwargs={'features_extractor_class': extractor,
+                           'normalize_images': False, 'net_arch': net_arch})
     args.output.mkdir(parents=True, exist_ok=False)
     corpus = Corpus(args.roots, threads=args.threads)
     training, validation, split = corpus.split(args.seed)
@@ -167,7 +171,7 @@ def main(argv=None):
                 custom_objects={'n_steps': 2, 'n_envs': 1, 'batch_size': 2})
         for group in model.policy.optimizer.param_groups:
             group['lr'] = args.learning_rate
-    elif args.extractor == 'ego':
+    elif args.extractor in ('ego', 'ego-wide'):
         model = new_ego_model(args.learning_rate, args.seed, args.device)
     else:
         model = _new_model(args.learning_rate, args.seed, args.device)
