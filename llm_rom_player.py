@@ -98,6 +98,8 @@ class ScheduleCommander:
         self.calls += 1
         if state is not None and state.remaining_enemies <= self.switch_at:
             return {'mode': 'hunt'}, 'phase2'
+        if self.opening == 'anchor':
+            return {'mode': 'anchor'}, 'phase1'
         order = {'mode': self.opening}
         if self.opening == 'goto' and self.target:
             order['target'] = list(self.target)
@@ -107,14 +109,19 @@ class ScheduleCommander:
 def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                      llm_every=30, max_calls=80, max_frames=12000,
                      depth=12, plan_seeds=3, use_veto=True,
-                     initial_mode='hunt', record_demos=False, record_video=True):
+                     initial_mode='hunt', record_demos=False, record_video=True,
+                     guard_bot=False):
     from stable_baselines3.common.utils import set_random_seed
     from rust_train import ROMPrimitiveEnv
     planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
                              plan_rng_seed=seed & 0xffffffff) if use_veto else None
     env = ROMPrimitiveEnv(stage, max_frames)
     raw = env.env
-    bot = HeuristicBot()
+    if guard_bot:
+        from base_guard import BaseGuardBot
+        bot = BaseGuardBot()
+    else:
+        bot = HeuristicBot()
     parser = CachedParser()
     order = {'mode': initial_mode}
     events = []
@@ -237,6 +244,8 @@ def main(argv=None):
                         help='local MLP commander checkpoint instead of the LLM')
     parser.add_argument('--schedule', default=None,
                         help='scripted commander "opening,switch_at[,row,col]"')
+    parser.add_argument('--guard-bot', action='store_true',
+                        help='flank-post base defence executor')
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -268,7 +277,8 @@ def main(argv=None):
                 episode_tag=f'stage{stage:02d}-ep{episode}-s{args.base_seed}{args.tag_suffix}',
                 llm_every=args.llm_every, max_calls=args.max_calls,
                 use_veto=not args.no_veto, initial_mode=args.initial_mode,
-                record_demos=args.record_demos, record_video=not args.no_video)
+                record_demos=args.record_demos, record_video=not args.no_video,
+                guard_bot=args.guard_bot)
             if hasattr(commander, 'log'):
                 commander.log.close()
             with results_path.open('a', encoding='utf-8') as stream:

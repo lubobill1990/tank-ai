@@ -245,9 +245,38 @@ def execute_order(bot, state, order):
         action = bot.advise('dodge', state) or bot.advise('counter', state)
         if action:
             return action
+    # Tactical reflex: a guard bot drops everything when the bottom corridor
+    # beside the base is threatened - that lane killed every lost base.
+    from base_guard import BaseGuardBot, bottom_threats
+    if isinstance(bot, BaseGuardBot):
+        if bottom_threats(state):
+            action = bot._protect(state)
+            if action:
+                return action
+        # Shovel turns the fortress to steel, grenade clears the screen and
+        # star upgrades firepower: always worth the detour.
+        if state.item is not None and state.item.kind in (2, 3, 4):
+            action = bot.advise('item', state)
+            if action:
+                return action
     mode = order['mode']
     if mode == 'hold':
         return bot.advise('counter', state) or aim_without_moving(bot, state)
+    if mode == 'anchor':
+        # Tower-defence: never leave the base area; enemies come to you.
+        player = state.player
+        base_dist = abs(player.x - 120) + abs(player.y - 216)
+        action = bot.advise('counter', state) or aim_without_moving(bot, state)
+        if action:
+            return action
+        near = [e for e in state.enemies
+                if abs(e.x - 120) + abs(e.y - 216) <= 112]
+        if near and base_dist <= 96:
+            target = min(near, key=lambda e: abs(e.x - player.x) + abs(e.y - player.y))
+            return bot._navigate('item', state, (target.x, target.y))
+        if base_dist > 56:
+            return bot._navigate('protect', state, (120, 184))
+        return 0
     if mode == 'item' and state.item is not None:
         return bot.advise('item', state)
     if mode == 'goto':
