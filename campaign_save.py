@@ -88,7 +88,7 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                 attempts = attempt + 1
                 if attempt > 0:
                     env.nes._restore()
-                    for _ in range(int(rng.integers(1, 48))):
+                    for _ in range(int(rng.integers(1, 240))):
                         env.nes.step(0)
                     soft_advance(env, stage)
                 segment = segments_dir / f'stage{stage:02d}.mp4'
