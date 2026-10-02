@@ -42,11 +42,12 @@ class Stream:
 
 
 class Corpus:
-    def __init__(self, roots, threads=8):
+    def __init__(self, roots, threads=8, channels=47):
         from native_codec import NativeRunCodec
         # decode() is stateless (only encode uses the scratch buffer), so one
         # shared codec instance is thread-safe for reading.
-        self.codec = NativeRunCodec((47, 26, 26))
+        self.channels = channels
+        self.codec = NativeRunCodec((channels, 26, 26))
         self.streams = []
         for root in roots:
             for meta in sorted(Path(root).rglob('metadata.json')):
@@ -94,12 +95,13 @@ class Corpus:
 
     def batch(self, indices):
         count = len(indices)
-        observations = np.zeros((count, 94, 26, 26), np.float32)
+        c = self.channels
+        observations = np.zeros((count, 2 * c, 26, 26), np.float32)
         tasks = [(row, int(index)) for row, index in enumerate(indices)]
         for row, frame, previous in self.pool.map(self._decode_one, tasks):
-            observations[row, 47:] = frame
+            observations[row, c:] = frame
             if previous is not None:
-                observations[row, :47] = previous
+                observations[row, :c] = previous
         return {'observations': observations,
                 'actions': self.actions[indices],
                 'action_masks': self.masks[indices]}

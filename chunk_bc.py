@@ -23,24 +23,61 @@ if str(ROOT) not in sys.path:
 from bc_fast import Corpus
 
 
-def build_model(chunk):
+def center_observations_c(observations, channels):
+    """Channel-count-agnostic clone of ego_encoder.center_observations.
+
+    Per-frame plane 5 is the player plane; frame-local scalars 24 (lives) and
+    20 (fire_ready) match the canonical 94-layout indices 71 and 67.
+    """
+    import torch
+    import torch.nn.functional as F
+    with torch.no_grad():
+        frames = observations.detach()
+        current = frames[:, channels + 5].clamp(0, 1)
+        previous = frames[:, 5].clamp(0, 1)
+        current_count = current.sum(dim=(1, 2))
+        previous_count = previous.sum(dim=(1, 2))
+        player = torch.where((current_count > 0)[:, None, None], current, previous)
+        count = player.sum(dim=(1, 2)).clamp_min(1)
+        axis = torch.arange(26, device=frames.device, dtype=frames.dtype)
+        x = (player * axis[None, None, :]).sum(dim=(1, 2)) / count
+        y = (player * axis[None, :, None]).sum(dim=(1, 2)) / count
+        present = (current_count > 0) | (previous_count > 0)
+        x = torch.where(present, x, torch.full_like(x, 12.5))
+        y = torch.where(present, y, torch.full_like(y, 12.5))
+        offset = torch.arange(-12, 13, device=frames.device, dtype=frames.dtype)
+        oy, ox = torch.meshgrid(offset, offset, indexing='ij')
+        sample_x = torch.floor(x + .5)[:, None, None] + ox[None]
+        sample_y = torch.floor(y + .5)[:, None, None] + oy[None]
+        grid = torch.stack((sample_x * (2 / 25) - 1, sample_y * (2 / 25) - 1), dim=-1)
+        centered = F.grid_sample(frames, grid, mode='nearest', padding_mode='zeros',
+                                 align_corners=True)
+        scalars = torch.stack((x * (2 / 25) - 1, y * (2 / 25) - 1,
+                               frames[:, channels + 24, 0, 0],
+                               frames[:, channels + 20, 0, 0]), dim=1)
+        return centered, scalars
+
+
+def build_model(chunk, channels=47):
     import torch
     import torch.nn as nn
-    from learning_lab.ego_encoder import center_observations
+
+    planes = 2 * channels
 
     class ChunkPolicy(nn.Module):
         def __init__(self):
             super().__init__()
             self.chunk = chunk
+            self.channels = channels
             self.local_cnn = nn.Sequential(
-                nn.Conv2d(94, 64, 3, padding=1), nn.ReLU(),
+                nn.Conv2d(planes, 64, 3, padding=1), nn.ReLU(),
                 nn.Conv2d(64, 96, 3, padding=1), nn.ReLU(),
                 nn.Conv2d(96, 96, 3, stride=2, padding=1), nn.ReLU(),
                 nn.Conv2d(96, 128, 3, stride=2, padding=1), nn.ReLU(),
                 nn.Flatten(), nn.Linear(128 * 7 * 7, 384), nn.ReLU(),
             )
             self.global_cnn = nn.Sequential(
-                nn.Conv2d(94, 32, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(planes, 32, 3, stride=2, padding=1), nn.ReLU(),
                 nn.Conv2d(32, 48, 3, stride=2, padding=1), nn.ReLU(),
                 nn.Conv2d(48, 64, 3, stride=2, padding=1), nn.ReLU(),
                 nn.Flatten(), nn.Linear(64 * 4 * 4, 128), nn.ReLU(),
@@ -49,7 +86,7 @@ def build_model(chunk):
             self.head = nn.Linear(512, chunk * 10)
 
         def forward(self, observations):
-            centered, scalars = center_observations(observations)
+            centered, scalars = center_observations_c(observations, self.channels)
             local = self.local_cnn(centered)
             global_map = self.global_cnn(observations.detach())
             h = self.trunk(torch.cat((local, global_map, scalars), dim=1))
@@ -85,6 +122,7 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--threads', type=int, default=8)
+    parser.add_argument('--channels', type=int, default=47)
     parser.add_argument('--initial-checkpoint', type=Path, default=None)
     args = parser.parse_args(argv)
 
@@ -92,11 +130,11 @@ def main(argv=None):
     import torch.nn.functional as F
     torch.manual_seed(args.seed)
     args.output.mkdir(parents=True, exist_ok=False)
-    corpus = Corpus(args.roots, threads=args.threads)
+    corpus = Corpus(args.roots, threads=args.threads, channels=args.channels)
     training, validation, split = corpus.split(args.seed)
     print(json.dumps({'samples': len(corpus), 'train': len(training),
                       'validation': len(validation), **split}), flush=True)
-    model = build_model(args.chunk).to(args.device)
+    model = build_model(args.chunk, args.channels).to(args.device)
     if args.initial_checkpoint is not None:
         payload = torch.load(args.initial_checkpoint, map_location=args.device,
                              weights_only=False)
@@ -151,7 +189,8 @@ def main(argv=None):
                         'epoch_seconds': time.monotonic() - epoch_start})
         print(json.dumps(history[-1]), flush=True)
         torch.save({'state_dict': model.state_dict(), 'chunk': args.chunk,
-                    'history': history}, args.output / 'final.pt')
+                    'channels': args.channels, 'history': history},
+                   args.output / 'final.pt')
     (args.output / 'report.json').write_text(json.dumps({
         'history': history, 'roots': [str(r) for r in args.roots],
         'config': {k: (str(v) if isinstance(v, Path) else v)

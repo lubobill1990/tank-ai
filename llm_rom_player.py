@@ -31,6 +31,24 @@ from mpc_teacher import CachedParser, MpcVetoTeacher
 BASE_X, BASE_Y = 120, 216
 
 
+class Writer55(DemonstrationWriter):
+    """DemonstrationWriter variant storing 55-channel precision frames."""
+
+    def __init__(self, path):
+        super().__init__(path)
+        from native_codec import NativeRunCodec
+        self.codec = NativeRunCodec((55, 26, 26))
+
+    def finish(self, episode_reports, metadata):
+        result = super().finish(episode_reports, metadata)
+        meta_path = self.path / 'metadata.json'
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        meta['frame_shape'] = [55, 26, 26]
+        meta['format'] = 'native-run-demonstrations-55-v1'
+        meta_path.write_text(json.dumps(meta, indent=2), encoding='utf-8')
+        return result
+
+
 def strategy_features(state):
     """Compact numeric summary of a decision state for strategist training."""
     player = state.player
@@ -110,7 +128,7 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                      llm_every=30, max_calls=80, max_frames=12000,
                      depth=12, plan_seeds=3, use_veto=True,
                      initial_mode='hunt', record_demos=False, record_video=True,
-                     guard_bot=False):
+                     guard_bot=False, demo_channels='47'):
     from stable_baselines3.common.utils import set_random_seed
     from rust_train import ROMPrimitiveEnv
     planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
@@ -130,9 +148,13 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
     outcome, info = 'unfinished', {}
     partial = Path(output_dir) / f'.partial-{episode_tag}.mp4'
     video = EpisodeVideo(partial) if record_video else None
-    writer = None
+    writer = writer55 = None
     if record_demos:
-        writer = DemonstrationWriter(Path(output_dir) / 'demos' / episode_tag)
+        if demo_channels in ('47', 'both'):
+            writer = DemonstrationWriter(Path(output_dir) / 'demos' / episode_tag)
+        if demo_channels in ('55', 'both'):
+            from within_stage.observation import encode_precision
+            writer55 = Writer55(Path(output_dir) / 'demos55' / episode_tag)
     strategy_rows = []
     veto_failures = 0
     started = time.perf_counter()
@@ -179,10 +201,16 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                     action = int(planner.choose(scores, unsafe, [masks], [action])[0])
                 except Exception:
                     veto_failures += 1
-            if writer is not None:
-                writer.add(np.asarray(observation, np.float32), int(action),
-                           masks, episode_start=episode_start,
-                           executed_action=int(action))
+            if writer is not None or writer55 is not None:
+                frame47 = np.asarray(observation, np.float32)
+                if writer is not None:
+                    writer.add(frame47, int(action), masks,
+                               episode_start=episode_start,
+                               executed_action=int(action))
+                if writer55 is not None:
+                    writer55.add(encode_precision(state, frame47), int(action),
+                                 masks, episode_start=episode_start,
+                                 executed_action=int(action))
                 episode_start = False
             observation, _, terminated, truncated, step_info = env.step(int(action))
             if video is not None:
@@ -194,15 +222,19 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
     finally:
         if video is not None:
             video.close()
+    demo_report = [{'episode_id': 0, 'outcome': outcome, 'stage': stage,
+                    'kills': info.get('kills'), 'deaths': info.get('deaths'),
+                    'frames': info.get('frames'), 'seed': seed}]
+    demo_meta = {'collector': 'llm-commander-rom-v1', 'stage': stage,
+                 'stream': 0, 'base_seed': seed,
+                 'model': getattr(commander, 'model', 'schedule'),
+                 'initial_mode': initial_mode, 'llm_every': llm_every,
+                 'noise': 0.0, 'beta': 1.0,
+                 'backend': 'original-rom-llm-commander'}
     if writer is not None:
-        writer.finish([{'episode_id': 0, 'outcome': outcome, 'stage': stage,
-                        'kills': info.get('kills'), 'deaths': info.get('deaths'),
-                        'frames': info.get('frames'), 'seed': seed}],
-                      {'collector': 'llm-commander-rom-v1', 'stage': stage,
-                       'stream': 0, 'base_seed': seed, 'model': commander.model,
-                       'initial_mode': initial_mode, 'llm_every': llm_every,
-                       'noise': 0.0, 'beta': 1.0,
-                       'backend': 'original-rom-llm-commander'})
+        writer.finish(demo_report, demo_meta)
+    if writer55 is not None:
+        writer55.finish(demo_report, dict(demo_meta, observation='precision55'))
     if strategy_rows:
         with (Path(output_dir) / 'strategy.jsonl').open('a', encoding='utf-8') as f:
             for row in strategy_rows:
@@ -239,6 +271,7 @@ def main(argv=None):
     parser.add_argument('--initial-mode', default='hunt',
                         choices=('hunt', 'protect', 'hold'))
     parser.add_argument('--record-demos', action='store_true')
+    parser.add_argument('--demo-channels', choices=('47', '55', 'both'), default='47')
     parser.add_argument('--no-video', action='store_true')
     parser.add_argument('--strategist', type=Path, default=None,
                         help='local MLP commander checkpoint instead of the LLM')
@@ -278,7 +311,7 @@ def main(argv=None):
                 llm_every=args.llm_every, max_calls=args.max_calls,
                 use_veto=not args.no_veto, initial_mode=args.initial_mode,
                 record_demos=args.record_demos, record_video=not args.no_video,
-                guard_bot=args.guard_bot)
+                guard_bot=args.guard_bot, demo_channels=args.demo_channels)
             if hasattr(commander, 'log'):
                 commander.log.close()
             with results_path.open('a', encoding='utf-8') as stream:

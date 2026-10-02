@@ -38,10 +38,13 @@ def main(argv=None):
     from rust_train import ROMPrimitiveEnv
     payload = torch.load(args.model, map_location=args.device, weights_only=False)
     chunk = payload['chunk']
-    model = build_model(chunk).to(args.device)
+    channels = payload.get('channels', 47)
+    model = build_model(chunk, channels).to(args.device)
     model.load_state_dict(payload['state_dict'])
     model.eval()
     stride = min(args.stride, chunk)
+    if channels == 55:
+        from within_stage.observation import encode_precision
 
     stages = []
     for part in args.stages.split(','):
@@ -59,7 +62,9 @@ def main(argv=None):
             raw = env.env
             set_random_seed(seed)
             observation, _ = env.reset(seed=seed)
-            previous = np.zeros((47, 26, 26), np.float32)
+            if channels == 55:
+                observation = encode_precision(raw.state, np.asarray(observation, np.float32))
+            previous = np.zeros((channels, 26, 26), np.float32)
             queue_logits = None
             queue_pos = 0
             outcome, info = 'unfinished', {}
@@ -76,6 +81,9 @@ def main(argv=None):
                 queue_pos += 1
                 previous = np.asarray(observation, np.float32)
                 observation, _, terminated, truncated, step_info = env.step(action)
+                if channels == 55:
+                    observation = encode_precision(raw.state,
+                                                   np.asarray(observation, np.float32))
                 if terminated or truncated:
                     outcome = step_info.get('outcome', 'unknown')
                     info = step_info
