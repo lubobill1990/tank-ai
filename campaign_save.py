@@ -61,7 +61,9 @@ def play_stage(env, stage, planner_seed, max_frames, video):
 
 
 def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
-        record_video=True):
+        record_video=True, exit_floors=None, stage_attempts=None):
+    exit_floors = exit_floors or {}
+    stage_attempts = stage_attempts or {}
     output_dir = Path(output_dir)
     segments_dir = output_dir / f'{tag}-segments'
     segments_dir.mkdir(parents=True, exist_ok=True)
@@ -80,7 +82,9 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
             env.nes._backup()
             cleared = False
             attempts = 0
-            for attempt in range(max_attempts):
+            floor = exit_floors.get(stage, 0)
+            budget = stage_attempts.get(stage, max_attempts)
+            for attempt in range(budget):
                 attempts = attempt + 1
                 if attempt > 0:
                     env.nes._restore()
@@ -99,7 +103,7 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                     if video is not None and done_clear and stage < 35:
                         # Keep rolling through the interlude on this segment.
                         pass
-                if outcome == 'clear':
+                if outcome == 'clear' and (info.get('lives') or 0) >= floor:
                     cleared = True
                     break
                 if video is not None:
@@ -176,9 +180,19 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--max-attempts', type=int, default=30)
     parser.add_argument('--tag', default=None)
+    parser.add_argument('--exit-floors', default='',
+                        help='e.g. "33:2,30:2" - a clear only counts with lives >= N')
+    parser.add_argument('--stage-attempts', default='',
+                        help='e.g. "34:120" - per-stage attempt budget override')
     args = parser.parse_args(argv)
+
+    def parse_map(text):
+        return {int(k): int(v) for k, v in
+                (pair.split(':') for pair in text.split(',') if pair)}
+
     run(args.seed, args.output, tag=args.tag or f'saverun-seed{args.seed}',
-        max_attempts=args.max_attempts)
+        max_attempts=args.max_attempts, exit_floors=parse_map(args.exit_floors),
+        stage_attempts=parse_map(args.stage_attempts))
 
 
 if __name__ == '__main__':
