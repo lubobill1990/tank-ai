@@ -78,6 +78,32 @@ class EpisodeVideo:
         self.process.wait(timeout=120)
 
 
+class ScheduleCommander:
+    """Per-stage scripted strategy compiled from LLM gameplay: no network, no NN.
+
+    phase 1: the given opening order until remaining enemies <= switch_at;
+    phase 2: hunt. Dodge/counter overrides and the MPC veto still apply.
+    """
+
+    def __init__(self, opening, switch_at, target=None):
+        self.opening = opening
+        self.switch_at = switch_at
+        self.target = target
+        self.calls = 0
+        self.cost = 0.0
+        self.budget = float('inf')
+        self.model = f'schedule:{opening}@{switch_at}'
+
+    def order(self, state_text, state=None):
+        self.calls += 1
+        if state is not None and state.remaining_enemies <= self.switch_at:
+            return {'mode': 'hunt'}, 'phase2'
+        order = {'mode': self.opening}
+        if self.opening == 'goto' and self.target:
+            order['target'] = list(self.target)
+        return order, 'phase1'
+
+
 def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                      llm_every=30, max_calls=80, max_frames=12000,
                      depth=12, plan_seeds=3, use_veto=True,
@@ -209,6 +235,8 @@ def main(argv=None):
     parser.add_argument('--no-video', action='store_true')
     parser.add_argument('--strategist', type=Path, default=None,
                         help='local MLP commander checkpoint instead of the LLM')
+    parser.add_argument('--schedule', default=None,
+                        help='scripted commander "opening,switch_at[,row,col]"')
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -223,7 +251,11 @@ def main(argv=None):
     results_path = args.output / 'results.jsonl'
     for stage in stages:
         for episode in range(args.episodes):
-            if args.strategist is not None:
+            if args.schedule is not None:
+                parts = args.schedule.split(',')
+                target = ([int(parts[2]), int(parts[3])] if len(parts) > 3 else None)
+                commander = ScheduleCommander(parts[0], int(parts[1]), target)
+            elif args.strategist is not None:
                 from strategist import StrategistCommander
                 commander = StrategistCommander(args.strategist)
             else:
