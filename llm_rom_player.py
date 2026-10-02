@@ -136,10 +136,11 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
     env = ROMPrimitiveEnv(stage, max_frames)
     raw = env.env
     if guard_bot:
-        from base_guard import BaseGuardBot
+        from base_guard import BaseGuardBot, set_ice_penalty
         bot = BaseGuardBot()
     else:
         bot = HeuristicBot()
+        set_ice_penalty = None
     parser = CachedParser()
     order = {'mode': initial_mode}
     events = []
@@ -161,6 +162,9 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
     try:
         set_random_seed(seed)
         observation, _ = env.reset(seed=seed)
+        if set_ice_penalty is not None:
+            ice_cells = int((raw.state.terrain == gs.T_ICE).sum())
+            set_ice_penalty(8.0 if ice_cells > 80 else 0.0)
         if video is not None:
             video.write(raw.nes.screen)
         episode_start = True
@@ -279,6 +283,8 @@ def main(argv=None):
                         help='scripted commander "opening,switch_at[,row,col]"')
     parser.add_argument('--guard-bot', action='store_true',
                         help='flank-post base defence executor')
+    parser.add_argument('--depth', type=int, default=12)
+    parser.add_argument('--plan-seeds', type=int, default=3)
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -311,7 +317,8 @@ def main(argv=None):
                 llm_every=args.llm_every, max_calls=args.max_calls,
                 use_veto=not args.no_veto, initial_mode=args.initial_mode,
                 record_demos=args.record_demos, record_video=not args.no_video,
-                guard_bot=args.guard_bot, demo_channels=args.demo_channels)
+                guard_bot=args.guard_bot, demo_channels=args.demo_channels,
+                depth=args.depth, plan_seeds=args.plan_seeds)
             if hasattr(commander, 'log'):
                 commander.log.close()
             with results_path.open('a', encoding='utf-8') as stream:

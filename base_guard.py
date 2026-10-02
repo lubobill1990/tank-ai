@@ -26,6 +26,39 @@ BASE_X, BASE_Y = 120, 216
 LEFT_POST = (96, 216)
 RIGHT_POST = (144, 216)
 
+# Per-process ice navigation penalty (pixels of extra cost per ice cell the
+# swept segment touches). Zero disables; set per stage via set_ice_penalty.
+_ICE_PENALTY = 0.0
+_PATCHED = False
+
+
+def set_ice_penalty(value):
+    """Enable/disable ice-averse pathing; patches heuristic lazily, once."""
+    global _ICE_PENALTY, _PATCHED
+    _ICE_PENALTY = float(value)
+    if _PATCHED or _ICE_PENALTY == 0:
+        return
+    import math as _math
+    import heuristic as _heuristic
+    original = _heuristic._segment_cost
+
+    def ice_segment_cost(state, start, end, *, tunnel):
+        cost = original(state, start, end, tunnel=tunnel)
+        if _ICE_PENALTY == 0 or not _math.isfinite(cost):
+            return cost
+        x, y = start
+        tx, ty = end
+        bounds = (min(x, tx) - 8, min(y, ty) - 8, max(x, tx) + 8, max(y, ty) + 8)
+        ice = sum(1 for r, c in _heuristic._cells(bounds)
+                  if int(state.terrain[r, c]) == gs.T_ICE)
+        return cost + ice * _ICE_PENALTY
+
+    _heuristic._segment_cost = ice_segment_cost
+    # Methods captured the module global by name at call time, so rebinding
+    # the module attribute is sufficient; keep a handle for debugging.
+    _heuristic._segment_cost_original = original
+    _PATCHED = True
+
 
 def bottom_threats(state):
     return [e for e in state.enemies if e.y >= BOTTOM_BAND]
