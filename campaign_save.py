@@ -61,7 +61,7 @@ def play_stage(env, stage, planner_seed, max_frames, video):
 
 
 def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
-        record_video=True, exit_floors=None, stage_attempts=None):
+        record_video=True, exit_floors=None, stage_attempts=None, desync=240):
     exit_floors = exit_floors or {}
     stage_attempts = stage_attempts or {}
     output_dir = Path(output_dir)
@@ -82,13 +82,14 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
             env.nes._backup()
             cleared = False
             attempts = 0
-            floor = exit_floors.get(stage, 0)
+            entry_lives = env.state.lives
+            floor = min(exit_floors.get(stage, 0), entry_lives)
             budget = stage_attempts.get(stage, max_attempts)
             for attempt in range(budget):
                 attempts = attempt + 1
                 if attempt > 0:
                     env.nes._restore()
-                    for _ in range(int(rng.integers(1, 240))):
+                    for _ in range(int(rng.integers(1, desync))):
                         env.nes.step(0)
                     soft_advance(env, stage)
                 segment = segments_dir / f'stage{stage:02d}.mp4'
@@ -184,6 +185,7 @@ def main(argv=None):
                         help='e.g. "33:2,30:2" - a clear only counts with lives >= N')
     parser.add_argument('--stage-attempts', default='',
                         help='e.g. "34:120" - per-stage attempt budget override')
+    parser.add_argument('--desync', type=int, default=240)
     args = parser.parse_args(argv)
 
     def parse_map(text):
@@ -192,7 +194,7 @@ def main(argv=None):
 
     run(args.seed, args.output, tag=args.tag or f'saverun-seed{args.seed}',
         max_attempts=args.max_attempts, exit_floors=parse_map(args.exit_floors),
-        stage_attempts=parse_map(args.stage_attempts))
+        stage_attempts=parse_map(args.stage_attempts), desync=args.desync)
 
 
 if __name__ == '__main__':
