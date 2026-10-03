@@ -187,6 +187,9 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
         for step in range(max_frames // 4 + 4):
             ram = np.array(raw.nes.ram, dtype=np.uint8, copy=True)
             state = parser.parse(ram)
+            import base_guard
+            if base_guard.SPAWN_AMBUSH and isinstance(bot, HeuristicBot):
+                base_guard.note_spawn(bot, ram)
             if prev['lives'] is None:
                 prev['lives'] = state.lives
             if state.kills > prev['kills']:
@@ -318,6 +321,7 @@ def main(argv=None):
     parser.add_argument('--predict-guard', action='store_true')
     parser.add_argument('--intercept-fire', action='store_true')
     parser.add_argument('--press-spawn', action='store_true')
+    parser.add_argument('--spawn-ambush', action='store_true')
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -332,7 +336,8 @@ def main(argv=None):
     from base_guard import set_features
     set_features(predict_guard=args.predict_guard,
                  intercept_fire=args.intercept_fire,
-                 press_spawn=args.press_spawn)
+                 press_spawn=args.press_spawn,
+                 spawn_ambush=args.spawn_ambush)
     results_path = args.output / 'results.jsonl'
     for stage in stages:
         for episode in range(args.episodes):

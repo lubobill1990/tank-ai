@@ -68,7 +68,8 @@ def play_stage(env, stage, planner_seed, max_frames, video):
 
 
 def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
-        record_video=True, stage_attempts=None, desync=240, improve_exit=2):
+        record_video=True, stage_attempts=None, desync=240, improve_exit=2,
+        loops=1):
     stage_attempts = stage_attempts or {}
     output_dir = Path(output_dir)
     segments_dir = output_dir / f'{tag}-segments'
@@ -77,14 +78,17 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
     rng = np.random.default_rng(seed)
     log = []
     segments = []
-    stage = 1
+    stage = 1  # absolute stage counter: 1..35 is loop 1, 36..70 is loop 2
+    total_stages = 35 * loops
     final = 'unknown'
     started = time.perf_counter()
     try:
         from stable_baselines3.common.utils import set_random_seed
         set_random_seed(seed)
         env.reset(seed=seed)
-        while stage <= 35:
+        while stage <= total_stages:
+            display = ((stage - 1) % 35) + 1  # ROM 0x85 value for this stage
+            loop_no = (stage - 1) // 35 + 1
             env.nes._backup()
             cleared = False
             attempts = 0
@@ -132,11 +136,13 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                     video.close()
                     segment.unlink(missing_ok=True)
                     video = None
-            log.append({'stage': stage, 'attempts': attempts,
+            log.append({'stage': stage, 'display': display, 'loop': loop_no,
+                        'attempts': attempts,
                         'cleared': cleared, 'kills': info.get('kills'),
                         'deaths': info.get('deaths'), 'frames': info.get('frames'),
                         'lives_left': info.get('lives'),
                         'entry_lives': entry_lives,
+                        'loop_flag': int(env.nes.ram[0x46]),
                         'replay_mismatch': replay_mismatch})
             print(json.dumps(log[-1]), flush=True)
             if not cleared:
@@ -144,19 +150,21 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                 if video is not None:
                     video.close()
                 break
-            if stage == 35:
+            if stage == total_stages:
                 final = 'campaign_complete'
                 if video is not None:
                     video.close()
                     segments.append(segments_dir / f'stage{stage:02d}.mp4')
                 break
+            # The next map's display value wraps 35 -> 1 at a loop boundary.
+            next_display = (display % 35) + 1
             transitioned = False
             for frame in range(INTERLUDE_LIMIT):
                 env.nes.step(0)
                 if video is not None and frame % 4 == 0:
                     video.write(env.nes.screen)
                 ram = env.nes.ram
-                if int(ram[0x85]) == stage + 1 and 0x80 <= int(ram[0xa0]) < 0xe0 \
+                if int(ram[0x85]) == next_display and 0x80 <= int(ram[0xa0]) < 0xe0 \
                         and int(ram[0x80]) == 20:
                     transitioned = True
                     break
@@ -168,10 +176,10 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                 video.close()
                 segments.append(segments_dir / f'stage{stage:02d}.mp4')
             if not transitioned:
-                final = 'transition_failed'
+                final = f'transition_failed_after_{stage}'
                 break
             stage += 1
-            soft_advance(env, stage)
+            soft_advance(env, ((stage - 1) % 35) + 1)
     finally:
         env.close()
     result = {'seed': seed, 'final': final,
@@ -211,6 +219,9 @@ def main(argv=None):
     parser.add_argument('--improve-exit', type=int, default=2,
                         help='grind until a clear exits with >= N lives '
                              '(clamped to entry lives), then replay the best')
+    parser.add_argument('--loops', type=int, default=1,
+                        help='number of 35-stage loops to play; 2 = second '
+                             'loop (二周目) with stage-35 enemy rosters')
     args = parser.parse_args(argv)
 
     def parse_map(text):
@@ -220,7 +231,7 @@ def main(argv=None):
     run(args.seed, args.output, tag=args.tag or f'saverun-seed{args.seed}',
         max_attempts=args.max_attempts,
         stage_attempts=parse_map(args.stage_attempts), desync=args.desync,
-        improve_exit=args.improve_exit)
+        improve_exit=args.improve_exit, loops=args.loops)
 
 
 if __name__ == '__main__':

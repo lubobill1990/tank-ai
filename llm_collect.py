@@ -32,6 +32,8 @@ def run_stage(stage, args):
         command.append('--intercept-fire')
     if args.press_spawn:
         command.append('--press-spawn')
+    if args.spawn_ambush:
+        command.append('--spawn-ambush')
     proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     if proc.returncode:
         print(f'stage {stage:02d}: FAILED\n{proc.stderr[-1200:]}', flush=True)
@@ -65,6 +67,7 @@ def main():
     parser.add_argument('--predict-guard', action='store_true')
     parser.add_argument('--intercept-fire', action='store_true')
     parser.add_argument('--press-spawn', action='store_true')
+    parser.add_argument('--spawn-ambush', action='store_true')
     parser.add_argument('--workers', type=int, default=8)
     args = parser.parse_args()
     stages = []

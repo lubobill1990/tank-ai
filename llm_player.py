@@ -292,6 +292,11 @@ def execute_order(bot, state, order):
             action = intercept_aim(bot, state)
             if action:
                 return action
+        if base_guard.SPAWN_AMBUSH and mode == 'hunt':
+            from base_guard import spawn_ambush
+            action = spawn_ambush(bot, state)
+            if action:
+                return action
     if mode == 'hold':
         return bot.advise('counter', state) or aim_without_moving(bot, state)
     if mode == 'anchor':

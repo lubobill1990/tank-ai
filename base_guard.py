@@ -127,16 +127,63 @@ GUARD_RACE_MARGIN = 48  # px of head start we must keep over an intruder
 PREDICT_GUARD = False
 INTERCEPT_FIRE = False
 PRESS_SPAWN = False
+SPAWN_AMBUSH = False
+SPAWN_LANES = (24, 120, 216)
 
 
-def set_features(predict_guard=None, intercept_fire=None, press_spawn=None):
-    global PREDICT_GUARD, INTERCEPT_FIRE, PRESS_SPAWN
+def set_features(predict_guard=None, intercept_fire=None, press_spawn=None,
+                 spawn_ambush=None):
+    global PREDICT_GUARD, INTERCEPT_FIRE, PRESS_SPAWN, SPAWN_AMBUSH
     if predict_guard is not None:
         PREDICT_GUARD = bool(predict_guard)
     if intercept_fire is not None:
         INTERCEPT_FIRE = bool(intercept_fire)
     if press_spawn is not None:
         PRESS_SPAWN = bool(press_spawn)
+    if spawn_ambush is not None:
+        SPAWN_AMBUSH = bool(spawn_ambush)
+
+
+def note_spawn(bot, ram):
+    """Stash the engine-verified spawn state: countdown, next lane, interval.
+
+    RAM 0x82 counts down each frame and refills from 0x84 on a spawn; 0x6a is
+    the round-robin lane index, so the NEXT spawn appears at
+    x = SPAWN_LANES[(0x6a + 1) % 3], y = 24.
+    """
+    bot._spawn_timer = int(ram[0x82])
+    bot._spawn_lane_x = SPAWN_LANES[(int(ram[0x6a]) + 1) % 3]
+    bot._spawn_interval = max(int(ram[0x84]), 1)
+
+
+def spawn_ambush(bot, state):
+    """Camp the predicted spawn lane when we can arrive before the pop.
+
+    Fresh enemies play an activation animation during which they cannot turn,
+    so a tank waiting below the lane gets a free kill. Only worth the trip
+    when the timing works out and nothing presses the base.
+    """
+    player = state.player
+    timer = getattr(bot, '_spawn_timer', None)
+    if player is None or timer is None or state.spawn_left == 0:
+        return 0
+    if len(state.enemies) >= 4:
+        return 0  # slots full: nothing will spawn until something dies
+    lane_x = bot._spawn_lane_x
+    spot = (lane_x, 56)
+    travel = (abs(player.x - spot[0]) + abs(player.y - spot[1])) / 0.75
+    if timer > travel + 240 or timer < travel - 45:
+        return 0  # far too early, or we cannot make it in time
+    if abs(player.x - spot[0]) + abs(player.y - spot[1]) <= 10:
+        # Posted at the lane: aim up at the spawn tile and hold.
+        ghost = gs.Tank(slot=-1, x=lane_x, y=24, facing=gs.DOWN)
+        action = bot._aim(state, ghost)
+        if action:
+            return action
+        if player.facing != gs.UP:
+            return 1 + gs.UP
+        return 0
+    return bot._navigate('item', state, spot)
 
 
 def losing_guard_race(state):
