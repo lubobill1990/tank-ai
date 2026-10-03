@@ -39,19 +39,23 @@ def play_stage(env, stage, planner_seed, max_frames, video):
     commander = ScheduleCommander('hunt', 21)
     ice_cells = int((env.state.terrain == gs.T_ICE).sum())
     set_ice_penalty(8.0 if ice_cells > 80 else 0.0)
+    from base_guard import restrict_masks
+    last_action = None
     for _ in range(max_frames // 4 + 8):
         ram = np.array(env.nes.ram, dtype=np.uint8, copy=True)
         state = parser.parse(ram)
-        masks = np.asarray(env.action_masks()[:10], dtype=bool)
+        masks = restrict_masks(state, np.asarray(env.action_masks()[:10], dtype=bool))
         order, _ = commander.order(None, state=state)
         action = execute_order(bot, state, order)
         if not masks[action]:
             action = 0
         try:
             scores, unsafe = planner.plan(ram[None])
-            action = int(planner.choose(scores, unsafe, [masks], [action])[0])
+            action = int(planner.choose(scores, unsafe, [masks], [action],
+                                        [last_action])[0])
         except Exception:
             pass
+        last_action = action
         _, _, terminated, truncated, info = env.step(int(action))
         if video is not None:
             video.write(env.nes.screen)

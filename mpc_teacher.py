@@ -156,15 +156,25 @@ class MpcVetoTeacher:
         unsafe = (failed | ~legal_first).reshape(L, A, S).any(axis=2)
         return score, unsafe
 
-    def choose(self, scores, unsafe, masks, proposals):
-        """Prefer the proposal among safe near-best actions; veto deadly ones."""
+    def choose(self, scores, unsafe, masks, proposals, prev_actions=None):
+        """Prefer proposal, then the previous action, among safe near-best ones.
+
+        Keeping the previous action when the proposal is vetoed damps the
+        dithering that score noise otherwise causes between adjacent moves.
+        """
         actions = np.zeros(len(scores), np.int64)
         for i, (score, bad, mask, proposal) in enumerate(zip(scores, unsafe, masks, proposals)):
             legal_scores = np.where(mask, score, -1e9)
             best = float(legal_scores.max())
             safe = mask & ~bad & (score >= best - self.safety_margin)
+            previous = None if prev_actions is None else prev_actions[i]
             if safe.any():
-                actions[i] = proposal if safe[proposal] else int(np.argmax(np.where(safe, score, -1e9)))
+                if safe[proposal]:
+                    actions[i] = proposal
+                elif previous is not None and safe[previous]:
+                    actions[i] = previous
+                else:
+                    actions[i] = int(np.argmax(np.where(safe, score, -1e9)))
             else:
                 actions[i] = int(np.argmax(legal_scores))
         return actions

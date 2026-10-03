@@ -168,6 +168,7 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
         if video is not None:
             video.write(raw.nes.screen)
         episode_start = True
+        last_action = None
         for step in range(max_frames // 4 + 4):
             ram = np.array(raw.nes.ram, dtype=np.uint8, copy=True)
             state = parser.parse(ram)
@@ -196,15 +197,20 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                 decisions_since_call = 0
             decisions_since_call += 1
             masks = np.asarray(raw.action_masks()[:10], dtype=bool)
+            if guard_bot:
+                from base_guard import restrict_masks
+                masks = restrict_masks(state, masks)
             action = execute_order(bot, state, order)
             if not masks[action]:
                 action = 0
             if planner is not None:
                 try:
                     scores, unsafe = planner.plan(ram[None])
-                    action = int(planner.choose(scores, unsafe, [masks], [action])[0])
+                    action = int(planner.choose(scores, unsafe, [masks], [action],
+                                                [last_action])[0])
                 except Exception:
                     veto_failures += 1
+            last_action = action
             if writer is not None or writer55 is not None:
                 frame47 = np.asarray(observation, np.float32)
                 if writer is not None:

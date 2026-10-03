@@ -245,21 +245,22 @@ def execute_order(bot, state, order):
         action = bot.advise('dodge', state) or bot.advise('counter', state)
         if action:
             return action
-    # Tactical reflex: a guard bot drops everything when the bottom corridor
-    # beside the base is threatened - that lane killed every lost base.
-    from base_guard import BaseGuardBot, bottom_threats
+    # Tactical reflexes: bottom-corridor base defence first, then the
+    # value-aware item policy, then anti-dither recovery.
+    from base_guard import BaseGuardBot, bottom_threats, item_reflex, unstick
+    mode = order['mode']
     if isinstance(bot, BaseGuardBot):
         if bottom_threats(state):
             action = bot._protect(state)
             if action:
                 return action
-        # Shovel turns the fortress to steel, grenade clears the screen and
-        # star upgrades firepower: always worth the detour.
-        if state.item is not None and state.item.kind in (2, 3, 4):
-            action = bot.advise('item', state)
+        action = item_reflex(bot, state)
+        if action:
+            return action
+        if mode not in ('hold', 'goto'):
+            action = unstick(bot, state)
             if action:
                 return action
-    mode = order['mode']
     if mode == 'hold':
         return bot.advise('counter', state) or aim_without_moving(bot, state)
     if mode == 'anchor':
