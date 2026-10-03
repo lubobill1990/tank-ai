@@ -24,6 +24,8 @@ def run_stage(stage, args):
         command.append('--no-video')
     if args.guard_bot:
         command.append('--guard-bot')
+    if args.controller:
+        command += ['--controller', args.controller]
     proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     if proc.returncode:
         print(f'stage {stage:02d}: FAILED\n{proc.stderr[-1200:]}', flush=True)
@@ -53,6 +55,7 @@ def main():
     parser.add_argument('--initial-mode', default='protect')
     parser.add_argument('--no-video', action='store_true')
     parser.add_argument('--guard-bot', action='store_true')
+    parser.add_argument('--controller', default='')
     parser.add_argument('--workers', type=int, default=8)
     args = parser.parse_args()
     stages = []

@@ -128,14 +128,25 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                      llm_every=30, max_calls=80, max_frames=12000,
                      depth=12, plan_seeds=3, use_veto=True,
                      initial_mode='hunt', record_demos=False, record_video=True,
-                     guard_bot=False, demo_channels='47'):
+                     guard_bot=False, demo_channels='47', controller='reflex-v1'):
     from stable_baselines3.common.utils import set_random_seed
     from rust_train import ROMPrimitiveEnv
-    planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
-                             plan_rng_seed=seed & 0xffffffff) if use_veto else None
+    fsm = None
+    if controller == 'fsm-v2':
+        from state_machine import SequencePlanner, StatefulController
+        planner = SequencePlanner(depth=depth, plan_seeds=plan_seeds,
+                                  plan_rng_seed=seed & 0xffffffff) if use_veto else None
+        fsm = StatefulController(planner)
+    elif controller == 'reflex-seq':
+        from state_machine import SequencePlanner
+        planner = SequencePlanner(depth=depth, plan_seeds=plan_seeds,
+                                  plan_rng_seed=seed & 0xffffffff) if use_veto else None
+    else:
+        planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
+                                 plan_rng_seed=seed & 0xffffffff) if use_veto else None
     env = ROMPrimitiveEnv(stage, max_frames)
     raw = env.env
-    if guard_bot:
+    if guard_bot or fsm is not None or controller == 'reflex-seq':
         from base_guard import BaseGuardBot, set_ice_penalty
         bot = BaseGuardBot()
     else:
@@ -197,20 +208,23 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                 decisions_since_call = 0
             decisions_since_call += 1
             masks = np.asarray(raw.action_masks()[:10], dtype=bool)
-            if guard_bot:
+            if guard_bot or fsm is not None or controller == 'reflex-seq':
                 from base_guard import restrict_masks
                 masks = restrict_masks(state, masks)
-            action = execute_order(bot, state, order)
-            if not masks[action]:
-                action = 0
-            if planner is not None:
-                try:
-                    scores, unsafe = planner.plan(ram[None])
-                    action = int(planner.choose(scores, unsafe, [masks], [action],
-                                                [last_action])[0])
-                except Exception:
-                    veto_failures += 1
-            last_action = action
+            if fsm is not None:
+                action = fsm.decide(state, masks, ram)
+            else:
+                action = execute_order(bot, state, order)
+                if not masks[action]:
+                    action = 0
+                if planner is not None:
+                    try:
+                        scores, unsafe = planner.plan(ram[None])
+                        action = int(planner.choose(scores, unsafe, [masks],
+                                                    [action], [last_action])[0])
+                    except Exception:
+                        veto_failures += 1
+                last_action = action
             if writer is not None or writer55 is not None:
                 frame47 = np.asarray(observation, np.float32)
                 if writer is not None:
@@ -257,6 +271,7 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
         final = None
     env.close()
     return {'stage': stage, 'seed': seed, 'outcome': outcome,
+            'controller': controller,
             'kills': info.get('kills'), 'deaths': info.get('deaths'),
             'frames': info.get('frames'), 'lives': info.get('lives'),
             'llm_calls': commander.calls, 'cost_usd': round(commander.cost, 4),
@@ -291,6 +306,9 @@ def main(argv=None):
                         help='flank-post base defence executor')
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--plan-seeds', type=int, default=3)
+    parser.add_argument('--controller',
+                        choices=('reflex-v1', 'fsm-v2', 'reflex-seq'),
+                        default='reflex-v1')
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -324,7 +342,8 @@ def main(argv=None):
                 use_veto=not args.no_veto, initial_mode=args.initial_mode,
                 record_demos=args.record_demos, record_video=not args.no_video,
                 guard_bot=args.guard_bot, demo_channels=args.demo_channels,
-                depth=args.depth, plan_seeds=args.plan_seeds)
+                depth=args.depth, plan_seeds=args.plan_seeds,
+                controller=args.controller)
             if hasattr(commander, 'log'):
                 commander.log.close()
             with results_path.open('a', encoding='utf-8') as stream:
