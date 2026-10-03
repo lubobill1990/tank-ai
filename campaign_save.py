@@ -87,7 +87,10 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
         set_random_seed(seed)
         env.reset(seed=seed)
         while stage <= total_stages:
-            display = ((stage - 1) % 35) + 1  # ROM 0x85 value for this stage
+            # The ROM stage counter 0x85 keeps incrementing across loops
+            # (36, 37, ... in loop 2); only the displayed MAP wraps. So the
+            # absolute stage IS the 0x85 value; env.stage must match it.
+            display = ((stage - 1) % 35) + 1  # map number, for logging only
             loop_no = (stage - 1) // 35 + 1
             env.nes._backup()
             cleared = False
@@ -156,15 +159,15 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                     video.close()
                     segments.append(segments_dir / f'stage{stage:02d}.mp4')
                 break
-            # The next map's display value wraps 35 -> 1 at a loop boundary.
-            next_display = (display % 35) + 1
+            # 0x85 increments continuously (35 -> 36 at the loop boundary);
+            # the next stage's counter is always stage + 1.
             transitioned = False
             for frame in range(INTERLUDE_LIMIT):
                 env.nes.step(0)
                 if video is not None and frame % 4 == 0:
                     video.write(env.nes.screen)
                 ram = env.nes.ram
-                if int(ram[0x85]) == next_display and 0x80 <= int(ram[0xa0]) < 0xe0 \
+                if int(ram[0x85]) == stage + 1 and 0x80 <= int(ram[0xa0]) < 0xe0 \
                         and int(ram[0x80]) == 20:
                     transitioned = True
                     break
@@ -179,7 +182,7 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                 final = f'transition_failed_after_{stage}'
                 break
             stage += 1
-            soft_advance(env, ((stage - 1) % 35) + 1)
+            soft_advance(env, stage)  # env.stage tracks the 0x85 counter
     finally:
         env.close()
     result = {'seed': seed, 'final': final,
