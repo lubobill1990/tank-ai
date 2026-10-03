@@ -44,6 +44,9 @@ def play_stage(env, stage, planner_seed, max_frames, video):
     for _ in range(max_frames // 4 + 8):
         ram = np.array(env.nes.ram, dtype=np.uint8, copy=True)
         state = parser.parse(ram)
+        # Lives-adaptive caution: on the last life a near-best risky move is
+        # no longer acceptable; widen the veto's safety margin.
+        planner.safety_margin = 1.25 if state.lives <= 1 else 0.5
         masks = restrict_masks(state, np.asarray(env.action_masks()[:10], dtype=bool))
         order, _ = commander.order(None, state=state)
         action = execute_order(bot, state, order)
@@ -65,8 +68,7 @@ def play_stage(env, stage, planner_seed, max_frames, video):
 
 
 def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
-        record_video=True, exit_floors=None, stage_attempts=None, desync=240):
-    exit_floors = exit_floors or {}
+        record_video=True, stage_attempts=None, desync=240, improve_exit=2):
     stage_attempts = stage_attempts or {}
     output_dir = Path(output_dir)
     segments_dir = output_dir / f'{tag}-segments'
@@ -87,53 +89,71 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
             cleared = False
             attempts = 0
             entry_lives = env.state.lives
-            floor = min(exit_floors.get(stage, 0), entry_lives)
+            target_exit = min(improve_exit, entry_lives) if improve_exit else 0
             budget = stage_attempts.get(stage, max_attempts)
+            best = None  # (exit_lives, attempt, desync_draw)
+            replay_mismatch = False
+            # Exploration pass: no video; the accepted attempt is replayed
+            # deterministically afterwards (same snapshot, same desync, same
+            # planner seed) and recorded then.
             for attempt in range(budget):
                 attempts = attempt + 1
+                draw = 0
                 if attempt > 0:
                     env.nes._restore()
-                    for _ in range(int(rng.integers(1, desync))):
+                    draw = int(rng.integers(1, desync))
+                    for _ in range(draw):
                         env.nes.step(0)
                     soft_advance(env, stage)
-                segment = segments_dir / f'stage{stage:02d}.mp4'
+                outcome, info = play_stage(
+                    env, stage, seed * 1000 + stage * 37 + attempt,
+                    max_frames, None)
+                if outcome == 'clear':
+                    exit_lives = info.get('lives') or 0
+                    if best is None or exit_lives > best[0]:
+                        best = (exit_lives, attempt, draw)
+                    if exit_lives >= target_exit:
+                        break
+            segment = segments_dir / f'stage{stage:02d}.mp4'
+            video = None
+            if best is not None:
+                # Deterministic replay of the best clear, recorded this time.
+                env.nes._restore()
+                for _ in range(best[2]):
+                    env.nes.step(0)
+                soft_advance(env, stage)
                 video = EpisodeVideo(segment) if record_video else None
-                outcome, info = 'error', {}
-                try:
-                    outcome, info = play_stage(
-                        env, stage, seed * 1000 + stage * 37 + attempt,
-                        max_frames, video)
-                finally:
-                    done_clear = outcome == 'clear'
-                    if video is not None and done_clear and stage < 35:
-                        # Keep rolling through the interlude on this segment.
-                        pass
-                if outcome == 'clear' and (info.get('lives') or 0) >= floor:
-                    cleared = True
-                    break
-                if video is not None:
+                outcome, info = play_stage(
+                    env, stage, seed * 1000 + stage * 37 + best[1],
+                    max_frames, video)
+                cleared = outcome == 'clear'
+                replay_mismatch = not cleared
+                if not cleared and video is not None:
                     video.close()
                     segment.unlink(missing_ok=True)
+                    video = None
             log.append({'stage': stage, 'attempts': attempts,
                         'cleared': cleared, 'kills': info.get('kills'),
                         'deaths': info.get('deaths'), 'frames': info.get('frames'),
-                        'lives_left': info.get('lives')})
+                        'lives_left': info.get('lives'),
+                        'entry_lives': entry_lives,
+                        'replay_mismatch': replay_mismatch})
             print(json.dumps(log[-1]), flush=True)
             if not cleared:
                 final = f'gave_up_stage_{stage}'
-                if record_video:
+                if video is not None:
                     video.close()
                 break
             if stage == 35:
                 final = 'campaign_complete'
-                if record_video:
+                if video is not None:
                     video.close()
                     segments.append(segments_dir / f'stage{stage:02d}.mp4')
                 break
             transitioned = False
             for frame in range(INTERLUDE_LIMIT):
                 env.nes.step(0)
-                if record_video and frame % 4 == 0:
+                if video is not None and frame % 4 == 0:
                     video.write(env.nes.screen)
                 ram = env.nes.ram
                 if int(ram[0x85]) == stage + 1 and 0x80 <= int(ram[0xa0]) < 0xe0 \
@@ -142,9 +162,9 @@ def run(seed, output_dir, *, tag, max_attempts=30, max_frames=12000,
                     break
             for frame in range(16):
                 env.nes.step(0)
-                if record_video and frame % 4 == 0:
+                if video is not None and frame % 4 == 0:
                     video.write(env.nes.screen)
-            if record_video:
+            if video is not None:
                 video.close()
                 segments.append(segments_dir / f'stage{stage:02d}.mp4')
             if not transitioned:
@@ -185,11 +205,12 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--max-attempts', type=int, default=30)
     parser.add_argument('--tag', default=None)
-    parser.add_argument('--exit-floors', default='',
-                        help='e.g. "33:2,30:2" - a clear only counts with lives >= N')
     parser.add_argument('--stage-attempts', default='',
                         help='e.g. "34:120" - per-stage attempt budget override')
     parser.add_argument('--desync', type=int, default=240)
+    parser.add_argument('--improve-exit', type=int, default=2,
+                        help='grind until a clear exits with >= N lives '
+                             '(clamped to entry lives), then replay the best')
     args = parser.parse_args(argv)
 
     def parse_map(text):
@@ -197,8 +218,9 @@ def main(argv=None):
                 (pair.split(':') for pair in text.split(',') if pair)}
 
     run(args.seed, args.output, tag=args.tag or f'saverun-seed{args.seed}',
-        max_attempts=args.max_attempts, exit_floors=parse_map(args.exit_floors),
-        stage_attempts=parse_map(args.stage_attempts), desync=args.desync)
+        max_attempts=args.max_attempts,
+        stage_attempts=parse_map(args.stage_attempts), desync=args.desync,
+        improve_exit=args.improve_exit)
 
 
 if __name__ == '__main__':

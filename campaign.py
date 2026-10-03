@@ -78,6 +78,7 @@ def run_campaign(seed, output_dir, *, tag, max_frames=12000, depth=12,
             for _ in range(max_frames // 4 + 8):
                 ram = np.array(env.nes.ram, dtype=np.uint8, copy=True)
                 state = parser.parse(ram)
+                planner.safety_margin = 1.25 if state.lives <= 1 else 0.5
                 masks = restrict_masks(state,
                                        np.asarray(env.action_masks()[:10], dtype=bool))
                 order, _ = commander.order(None, state=state)
