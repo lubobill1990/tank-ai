@@ -126,14 +126,17 @@ GUARD_RACE_MARGIN = 48  # px of head start we must keep over an intruder
 # Feature toggles for controlled A/B evaluation (set per process).
 PREDICT_GUARD = False
 INTERCEPT_FIRE = False
+PRESS_SPAWN = False
 
 
-def set_features(predict_guard=None, intercept_fire=None):
-    global PREDICT_GUARD, INTERCEPT_FIRE
+def set_features(predict_guard=None, intercept_fire=None, press_spawn=None):
+    global PREDICT_GUARD, INTERCEPT_FIRE, PRESS_SPAWN
     if predict_guard is not None:
         PREDICT_GUARD = bool(predict_guard)
     if intercept_fire is not None:
         INTERCEPT_FIRE = bool(intercept_fire)
+    if press_spawn is not None:
+        PRESS_SPAWN = bool(press_spawn)
 
 
 def losing_guard_race(state):
@@ -288,6 +291,35 @@ def unstick(bot, state):
 
 
 class BaseGuardBot(HeuristicBot):
+    def _hunt(self, state):
+        """Optionally press the spawn line once firepower allows it.
+
+        With power >= 2 the winning tempo play is to fight at the TOP of the
+        map: enemies die as they arrive and never threaten the base. The
+        upfield bonus shifts target choice toward high spawn-side enemies;
+        all safety layers (dodge, veto, guard race) still apply.
+        """
+        if not PRESS_SPAWN:
+            return super()._hunt(state)
+        player = state.player
+        if player is None or player.power < 2 or state.lives < 2:
+            return super()._hunt(state)
+        enemies = sorted(state.enemies, key=lambda enemy: (
+            abs(enemy.x - player.x) + abs(enemy.y - player.y)
+            + (enemy.y - 16)  # upfield bonus: higher enemies first
+            - (24 if enemy.drops_item else 0),
+            enemy.slot,
+        ))
+        for enemy in enemies:
+            action = self._aim(state, enemy)
+            if action:
+                return action
+        for enemy in enemies:
+            action = self._navigate('hunt', state, (enemy.x, enemy.y))
+            if action:
+                return action
+        return 0
+
     def _protect(self, state):
         threats = bottom_threats(state)
         if not threats:

@@ -141,12 +141,16 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
         from state_machine import SequencePlanner
         planner = SequencePlanner(depth=depth, plan_seeds=plan_seeds,
                                   plan_rng_seed=seed & 0xffffffff) if use_veto else None
+    elif controller == 'reflex-guided':
+        from guided_mpc import GuidedPlanner
+        planner = GuidedPlanner(depth=depth, plan_seeds=plan_seeds,
+                                plan_rng_seed=seed & 0xffffffff) if use_veto else None
     else:
         planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
                                  plan_rng_seed=seed & 0xffffffff) if use_veto else None
     env = ROMPrimitiveEnv(stage, max_frames)
     raw = env.env
-    if guard_bot or fsm is not None or controller == 'reflex-seq':
+    if guard_bot or fsm is not None or controller in ('reflex-seq', 'reflex-guided'):
         from base_guard import BaseGuardBot, set_ice_penalty
         bot = BaseGuardBot()
     else:
@@ -208,7 +212,8 @@ def play_rom_episode(stage, *, seed, commander, output_dir, episode_tag,
                 decisions_since_call = 0
             decisions_since_call += 1
             masks = np.asarray(raw.action_masks()[:10], dtype=bool)
-            if guard_bot or fsm is not None or controller == 'reflex-seq':
+            if guard_bot or fsm is not None \
+                    or controller in ('reflex-seq', 'reflex-guided'):
                 from base_guard import restrict_masks
                 masks = restrict_masks(state, masks)
             if fsm is not None:
@@ -307,10 +312,12 @@ def main(argv=None):
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--plan-seeds', type=int, default=3)
     parser.add_argument('--controller',
-                        choices=('reflex-v1', 'fsm-v2', 'reflex-seq'),
+                        choices=('reflex-v1', 'fsm-v2', 'reflex-seq',
+                                 'reflex-guided'),
                         default='reflex-v1')
     parser.add_argument('--predict-guard', action='store_true')
     parser.add_argument('--intercept-fire', action='store_true')
+    parser.add_argument('--press-spawn', action='store_true')
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -324,7 +331,8 @@ def main(argv=None):
     args.output.mkdir(parents=True, exist_ok=True)
     from base_guard import set_features
     set_features(predict_guard=args.predict_guard,
-                 intercept_fire=args.intercept_fire)
+                 intercept_fire=args.intercept_fire,
+                 press_spawn=args.press_spawn)
     results_path = args.output / 'results.jsonl'
     for stage in stages:
         for episode in range(args.episodes):
