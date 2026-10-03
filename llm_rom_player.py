@@ -309,6 +309,8 @@ def main(argv=None):
     parser.add_argument('--controller',
                         choices=('reflex-v1', 'fsm-v2', 'reflex-seq'),
                         default='reflex-v1')
+    parser.add_argument('--predict-guard', action='store_true')
+    parser.add_argument('--intercept-fire', action='store_true')
     parser.add_argument('--tag-suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -320,6 +322,9 @@ def main(argv=None):
         else:
             stages.append(int(part))
     args.output.mkdir(parents=True, exist_ok=True)
+    from base_guard import set_features
+    set_features(predict_guard=args.predict_guard,
+                 intercept_fire=args.intercept_fire)
     results_path = args.output / 'results.jsonl'
     for stage in stages:
         for episode in range(args.episodes):

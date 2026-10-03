@@ -121,6 +121,97 @@ def bottom_threats(state):
     return [e for e in state.enemies if e.y >= BOTTOM_BAND]
 
 
+GUARD_RACE_MARGIN = 48  # px of head start we must keep over an intruder
+
+# Feature toggles for controlled A/B evaluation (set per process).
+PREDICT_GUARD = False
+INTERCEPT_FIRE = False
+
+
+def set_features(predict_guard=None, intercept_fire=None):
+    global PREDICT_GUARD, INTERCEPT_FIRE
+    if predict_guard is not None:
+        PREDICT_GUARD = bool(predict_guard)
+    if intercept_fire is not None:
+        INTERCEPT_FIRE = bool(intercept_fire)
+
+
+def losing_guard_race(state):
+    """Predictive base-defence trigger: are we about to lose the travel race?
+
+    The reactive y>=168 trigger fires when an intruder already owns the
+    bottom corridor - usually too late to walk back. Here the intruder's
+    remaining path to the base is compared against our path to the matching
+    flank post; the guard starts the moment waiting would lose the race.
+    """
+    player = state.player
+    if player is None:
+        return False
+    for enemy in state.enemies:
+        if enemy.y < 120:
+            continue
+        enemy_path = abs(enemy.x - BASE_X) + abs(enemy.y - BASE_Y)
+        post = LEFT_POST if enemy.x < BASE_X else RIGHT_POST
+        my_path = abs(player.x - post[0]) + abs(player.y - post[1])
+        if enemy_path - my_path < GUARD_RACE_MARGIN:
+            return True
+    return False
+
+
+def intercept_aim(bot, state):
+    """Predictive fire: shoot where a moving enemy and my bullet will meet.
+
+    _aim only fires at enemies already sitting on a firing lane. Tanks spend
+    most of their time crossing lanes instead; assuming an enemy keeps
+    moving along its facing at tank speed, fire early so the bullet and the
+    enemy reach the lane crossing together. Terrain and own-base safety use
+    the same guards as ordinary aimed fire.
+    """
+    from heuristic import _obstacle_time, _safe_fire, _fire_action
+    player = state.player
+    if player is None or not state.fire_ready:
+        return 0
+    bullet_speed = 4.0 if player.power >= 1 else 2.0
+    tank_speed = 1.0  # conservative upper band; basic tanks ~0.75 px/frame
+    for enemy in state.enemies:
+        evx, evy = gs.DXY[enemy.facing]
+        for facing, (dx, dy) in enumerate((gs.DXY[0], gs.DXY[1],
+                                           gs.DXY[2], gs.DXY[3])):
+            # Enemy must be moving ACROSS this firing lane, not along it.
+            if dx and not evy:
+                continue
+            if dy and not evx:
+                continue
+            if dx:  # horizontal lane: enemy crosses y == player.y
+                gap = (player.y - enemy.y)
+                if gap * evy <= 0:
+                    continue
+                t_cross = (abs(gap) - 6) / tank_speed
+                meet = enemy.x + evx * 0  # enemy x is constant while crossing
+                if (meet - player.x) * dx <= 8:
+                    continue
+                t_bullet = (abs(meet - player.x) - 8) / bullet_speed
+            else:  # vertical lane: enemy crosses x == player.x
+                gap = (player.x - enemy.x)
+                if gap * evx <= 0:
+                    continue
+                t_cross = (abs(gap) - 6) / tank_speed
+                meet = enemy.y
+                if (meet - player.y) * dy <= 8:
+                    continue
+                t_bullet = (abs(meet - player.y) - 8) / bullet_speed
+            if t_cross > 40 or abs(t_cross - t_bullet) > 5:
+                continue
+            if not _safe_fire(state, (player.x, player.y), facing):
+                continue
+            x, y = player.x + dx * 8, player.y + dy * 8
+            distance = abs(meet - (player.x if dx else player.y)) - 8
+            if _obstacle_time(state, x, y, dx, dy, distance) <= distance:
+                continue
+            return _fire_action(state, facing)
+    return 0
+
+
 ITEM_URGENT_AGE = 400  # decisions (~27s) before an uncollected item is urgent
 NEARBY_ITEM_COST = 56  # px of travel+demolition that makes any item a cheap grab
 

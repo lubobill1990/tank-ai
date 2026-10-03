@@ -271,10 +271,13 @@ def execute_order(bot, state, order):
         bot._dodge_commit = None
     # Tactical reflexes: bottom-corridor base defence first, then the
     # value-aware item policy, then anti-dither recovery.
-    from base_guard import BaseGuardBot, bottom_threats, item_reflex, unstick
+    import base_guard
+    from base_guard import (BaseGuardBot, bottom_threats, intercept_aim,
+                            item_reflex, losing_guard_race, unstick)
     mode = order['mode']
     if isinstance(bot, BaseGuardBot):
-        if bottom_threats(state):
+        if bottom_threats(state) or (base_guard.PREDICT_GUARD
+                                     and losing_guard_race(state)):
             action = bot._protect(state)
             if action:
                 return action
@@ -283,6 +286,10 @@ def execute_order(bot, state, order):
             return action
         if mode not in ('hold', 'goto'):
             action = unstick(bot, state)
+            if action:
+                return action
+        if base_guard.INTERCEPT_FIRE and mode == 'hunt':
+            action = intercept_aim(bot, state)
             if action:
                 return action
     if mode == 'hold':
