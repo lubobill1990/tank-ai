@@ -242,9 +242,33 @@ def execute_order(bot, state, order):
     if state.player is None or state.game_over:
         return 0
     if any(b.owner >= 2 for b in state.bullets):
-        action = bot.advise('dodge', state) or bot.advise('counter', state)
+        # Dodge with commitment: the per-decision argmin between adjacent
+        # escape directions flips as bullets advance, which reads as
+        # up/down dithering. Once a direction is taken, keep it for a few
+        # decisions while the threat persists and the lane stays open.
+        committed = getattr(bot, '_dodge_commit', None)
+        fresh = bot.advise('dodge', state)
+        if fresh:
+            if committed is not None and committed[1] > 0 \
+                    and committed[0] in (1, 2, 3, 4):
+                from heuristic import _DODGE_DISTANCE, _DXY, _segment_cost
+                import math
+                player = state.player
+                dx, dy = _DXY[committed[0] - 1]
+                end = (player.x + dx * _DODGE_DISTANCE,
+                       player.y + dy * _DODGE_DISTANCE)
+                if math.isfinite(_segment_cost(state, (player.x, player.y),
+                                               end, tunnel=False)):
+                    bot._dodge_commit = (committed[0], committed[1] - 1)
+                    return committed[0]
+            bot._dodge_commit = (fresh, 2)
+            return fresh
+        bot._dodge_commit = None
+        action = bot.advise('counter', state)
         if action:
             return action
+    else:
+        bot._dodge_commit = None
     # Tactical reflexes: bottom-corridor base defence first, then the
     # value-aware item policy, then anti-dither recovery.
     from base_guard import BaseGuardBot, bottom_threats, item_reflex, unstick

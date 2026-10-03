@@ -200,19 +200,37 @@ class BaseGuardBot(HeuristicBot):
     def _protect(self, state):
         threats = bottom_threats(state)
         if not threats:
+            self._guard_slot = None
             return super()._protect(state)
-        # Most urgent: closest to the base along the bottom corridor.
-        enemy = min(threats, key=lambda e: abs(e.y - BASE_Y) * 2 + abs(e.x - BASE_X))
+        # Sticky threat selection: keep tracking the same enemy while it is
+        # still in the bottom band; only retarget when it leaves/dies or a
+        # clearly closer intruder appears. Without hysteresis the argmin
+        # flips between two flanking enemies every few frames.
+        def urgency(e):
+            return abs(e.y - BASE_Y) * 2 + abs(e.x - BASE_X)
+        enemy = None
+        slot = getattr(self, '_guard_slot', None)
+        if slot is not None:
+            enemy = next((e for e in threats if e.slot == slot), None)
+        best = min(threats, key=urgency)
+        if enemy is None or urgency(best) + 48 < urgency(enemy):
+            enemy = best
+        self._guard_slot = enemy.slot
         action = self._aim(state, enemy)
         if action:
             return action
-        post = LEFT_POST if enemy.x < BASE_X else RIGHT_POST
+        # Sticky post side with a switching margin around the base centre.
+        side = getattr(self, '_guard_side', None)
+        if side is None or (enemy.x - BASE_X) * side < -16:
+            side = -1 if enemy.x < BASE_X else 1
+        self._guard_side = side
+        post = LEFT_POST if side < 0 else RIGHT_POST
         player = state.player
-        if (player.x, player.y) != post:
+        if abs(player.x - post[0]) + abs(player.y - post[1]) > 12:
             action = self._navigate('protect', state, post)
             if action:
                 return action
-        # Posted (or stuck): face the corridor and trade shots.
+        # Posted (or close enough): stand and trade shots, no micro-walking.
         action = self._counter(state)
         if action:
             return action
