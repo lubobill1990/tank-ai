@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import game_state as gs
-from llm_player import Commander, render_map, FACING_NAMES
+from llm_player import Commander, render_map, FACING_NAMES, TERRAIN_CHARS
 from mpc_teacher import MpcVetoTeacher, CachedParser, outcome_of
 from rust_env import NativeBatch, episode_seed, stage_ram
 
@@ -69,84 +69,257 @@ Movement rules: actions 1-4 move you one step AND turn you to face that way; a
 tank only moves in the direction it faces. To shoot an enemy you must face it
 (its row or column must line up with yours, nothing solid between) and fire -
 use 6/7/8/9 to aim-and-shoot in one action, or 5 if you already face the
-target. Your own bullet is 'o'; only one of your bullets exists at a time, so
-don't spam fire. Enemy bullets are '*' and kill you in one hit - step out of
-their row/column to dodge. '#' brick is destructible by shots and blocks
-movement; '@' steel and '~' water block movement; ',' ice makes you slide.
+target. Only ONE of your bullets exists at a time: if the live state says your
+cannon is RELOADING, firing does nothing - move instead. Enemy bullets kill you
+in one hit - if one shares your row (moving left/right) or your column (moving
+up/down), step sideways off that line immediately. '#' brick is destructible by
+shots and blocks movement; '@' steel and '~' water block movement; ',' ice
+makes you slide.
 
-Answer FORMAT - this is strict. Your reply MUST BEGIN with the action line,
-exactly:
-ACTION: <n>  HOLD: <h>
-where <n> is 0-9 and <h> is 1-6 = how many turns to repeat this action before
-you look again (larger HOLD for long straight travel through open space, HOLD 1
-when enemies or bullets are near and you must react every step). You MAY add at
-most ONE short clause of reasoning AFTER that line, never before it. Decide
-fast; the action line comes first, always."""
+HOW YOU SEE THE WORLD each turn:
+- A STATIC STAGE MAP (terrain only) is given once and stays fixed - use it to
+  understand the overall layout, lanes to the base, and where walls are.
+- A LIVE STATE block gives the fresh, authoritative positions every turn: your
+  cell and facing, each enemy's position described RELATIVE to you (e.g. "3 UP
+  and 2 LEFT"), incoming bullets, the item, and whether your cannon is ready.
+- A 9x9 LOCAL VIEW centred on you (P) shows your immediate surroundings live;
+  '%' marks the arena edge. Trust the LIVE STATE and LOCAL VIEW over the static
+  map when they disagree (walls you shot away, tanks that moved).
+- "Your last moves" lists what you just did - if you have been repeating a move
+  (e.g. left,right,left,right) without progress, you are stuck oscillating:
+  change plan, pick a concrete target enemy and drive/align to it.
+
+Priorities, in order: (1) survive - dodge any bullet on your line; (2) keep the
+base safe - intercept any enemy in the bottom rows or heading for the base;
+(3) hunt - align with an enemy and fire to kill all 20. Do not wander.
+
+Answer FORMAT - strict, exactly these five lines in this order and nothing else:
+PLAN: <your MACRO goal; a durable multi-turn intention, e.g. "hold the base
+  column 12 until enemies thin out, then hunt top enemies". KEEP the same PLAN
+  across turns unless the battlefield clearly changed - do not flip-flop.>
+SUBGOAL: <your MICRO goal right now; a concrete next step, e.g. "reach column 9
+  then turn up to line up the enemy at row 5">
+ASSESS: <one-line read of the battlefield: biggest threat, is the base safe>
+ACTION: <n>  HOLD: <h>   (n is 0-9; h is 1-6 turns to repeat before re-looking:
+  larger h for long straight travel in open space, h=1 when enemies/bullets are
+  near and you must react every step)
+WHY: <one short clause: why THIS action serves the SUBGOAL/PLAN now>
+
+Keep every line to one sentence. Your PLAN and SUBGOAL from last turn are shown
+back to you - stay consistent with them unless you justify a change in ASSESS."""
 
 
-def render_direct(state, stage, frame):
-    """Compact board + status + reminder, framed for single-action control."""
-    lines = [f'Stage {stage}, frame {frame} (~{frame // 60}s into the stage).']
+def _live_grid(state):
+    """Full 26x26 char grid with live terrain, tanks, bullets and item."""
+    grid = [[TERRAIN_CHARS[int(v)] for v in row] for row in state.terrain]
+    for bullet in state.bullets:
+        r, c = (bullet.y - gs.ARENA) // gs.CELL, (bullet.x - gs.ARENA) // gs.CELL
+        if 0 <= r < 26 and 0 <= c < 26:
+            grid[r][c] = '*' if bullet.owner >= 2 else 'o'
+    if state.item is not None:
+        r, c = (state.item.y - gs.ARENA) // gs.CELL, (state.item.x - gs.ARENA) // gs.CELL
+        if 0 <= r < 26 and 0 <= c < 26:
+            grid[r][c] = '$'
+    for enemy in state.enemies:
+        r, c = enemy.tile
+        if 0 <= r < 26 and 0 <= c < 26:
+            grid[r][c] = 'A' if enemy.armor > 1 else 'E'
+    if state.player is not None:
+        r, c = state.player.tile
+        if 0 <= r < 26 and 0 <= c < 26:
+            grid[r][c] = 'P'
+    return grid
+
+
+def render_terrain_static(state):
+    """Terrain-only global map, fixed for the whole stage -> cached once.
+
+    Only brick ('#') is destructible; steel/water/base/ice never change. Live
+    walls near the player are always shown accurately in the egocentric view,
+    so minor brick staleness here (a wall the player already shot away) does not
+    mislead local decisions while keeping this block byte-identical for caching.
+    """
+    grid = [[TERRAIN_CHARS[int(v)] for v in row] for row in state.terrain]
+    header = '      ' + ''.join(str(c % 10) for c in range(26))
+    rows = [f'row {r:>2} ' + ''.join(grid[r]) for r in range(26)]
+    legend = ("Legend: '.'=open  '#'=brick(destructible, blocks)  '@'=steel"
+              "(blocks)  '~'=water(blocks tanks)  ','=ice(slippery)  'X'=base")
+    return ('STATIC STAGE MAP (terrain only; row 0 top, col 0 left; your base X '
+            'is at rows 24-25, cols 12-13):\n' + header + '\n'
+            + '\n'.join(rows) + '\n' + legend)
+
+
+def _rel(dr, dc):
+    """Human egocentric phrase for a (drow, dcol) offset from the player."""
+    parts = []
+    if dr < 0:
+        parts.append(f'{-dr} UP')
+    elif dr > 0:
+        parts.append(f'{dr} DOWN')
+    if dc < 0:
+        parts.append(f'{-dc} LEFT')
+    elif dc > 0:
+        parts.append(f'{dc} RIGHT')
+    return ' and '.join(parts) if parts else 'same cell'
+
+
+def render_ego(state, radius=4):
+    """Local egocentric grid centred on the player (live entities + walls)."""
+    if state.player is None:
+        return '(respawning - no local view)'
+    grid = _live_grid(state)
+    pr, pc = state.player.tile
+    rows = []
+    for r in range(pr - radius, pr + radius + 1):
+        cells = []
+        for c in range(pc - radius, pc + radius + 1):
+            if 0 <= r < 26 and 0 <= c < 26:
+                cells.append(grid[r][c])
+            else:
+                cells.append('%')  # outside the arena wall
+        rows.append(''.join(cells))
+    return '\n'.join(rows)
+
+
+def render_dynamic(state, stage, frame, history, kills, plan='', subgoal=''):
+    """Small, fast-changing block: live positions, threats, your recent moves.
+
+    Everything static (rules, terrain) lives in cached blocks; only this delta
+    is fresh input each turn, so prompt caching covers the bulk of the tokens.
+    The standing PLAN/SUBGOAL from last turn are echoed back for consistency.
+    """
+    lines = [f'=== LIVE STATE  stage {stage}, frame {frame} (~{frame//60}s) ===']
+    if plan:
+        lines.append(f'Your standing PLAN (from last turn): {plan}')
+    if subgoal:
+        lines.append(f'Your standing SUBGOAL (from last turn): {subgoal}')
     player = state.player
     if player is not None:
         pr, pc = player.tile
-        lines.append(f'You (P) are at cell ({pr},{pc}), facing '
-                     f'{FACING_NAMES[player.facing]}, power {player.power}, '
-                     f'lives left {state.lives}.')
+        lines.append(f'You (P) at (row {pr}, col {pc}) facing '
+                     f'{FACING_NAMES[player.facing].upper()}. Lives {state.lives}, '
+                     f'power {player.power}. Enemies killed {kills}/20.')
     else:
-        lines.append(f'You are respawning this turn. Lives left {state.lives}.')
-    on_field = len(state.enemies)
-    lines.append(f'{state.remaining_enemies} enemy tanks still to kill '
-                 f'({on_field} on screen now, {state.spawn_left} not yet spawned).')
-    for enemy in state.enemies:
-        r, c = enemy.tile
-        base_d = abs(r - 25) + abs(c - 12)
-        extra = ' ARMORED' if enemy.armor > 1 else ''
-        carry = ' (carries item)' if enemy.drops_item else ''
-        lines.append(f'  enemy{extra} at ({r},{c}) facing '
-                     f'{FACING_NAMES[enemy.facing]}, {base_d} cells from your '
-                     f'base{carry}.')
+        lines.append(f'You are respawning. Lives {state.lives}. Killed {kills}/20.')
+    own = [b for b in state.bullets if b.owner < 2]
+    if own:
+        b = own[0]
+        r, c = (b.y - gs.ARENA) // gs.CELL, (b.x - gs.ARENA) // gs.CELL
+        lines.append(f'Cannon RELOADING: your bullet (o) still flying at '
+                     f'(row {r}, col {c}). Firing now is WASTED - move or reposition.')
+    elif state.fire_ready:
+        lines.append('Cannon READY to fire.')
+    lines.append(f'{state.remaining_enemies} enemies left to kill '
+                 f'({len(state.enemies)} on screen, {state.spawn_left} not spawned yet).')
+    if player is not None:
+        for enemy in state.enemies:
+            r, c = enemy.tile
+            dr, dc = r - player.tile[0], c - player.tile[1]
+            aligned = ''
+            if dr == 0:
+                aligned = ' [SAME ROW as you -> face LEFT/RIGHT and fire]'
+            elif dc == 0:
+                aligned = ' [SAME COLUMN as you -> face UP/DOWN and fire]'
+            tag = ' ARMORED' if enemy.armor > 1 else ''
+            carry = ' carries-item' if enemy.drops_item else ''
+            base_d = abs(r - 25) + abs(c - 12)
+            lines.append(f'  enemy{tag}{carry} at (row {r},col {c}) = {_rel(dr, dc)} '
+                         f'from you, facing {FACING_NAMES[enemy.facing]}, '
+                         f'{base_d} from base{aligned}.')
     threats = [b for b in state.bullets if b.owner >= 2]
     for b in threats:
         r, c = (b.y - gs.ARENA) // gs.CELL, (b.x - gs.ARENA) // gs.CELL
-        if abs(b.vx) >= abs(b.vy):
-            moving = 'right' if b.vx > 0 else 'left'
+        moving = ('right' if b.vx > 0 else 'left') if abs(b.vx) >= abs(b.vy) \
+            else ('down' if b.vy > 0 else 'up')
+        danger = ''
+        if player is not None:
+            dr, dc = r - player.tile[0], c - player.tile[1]
+            if (dr == 0 and moving in ('left', 'right')) or \
+               (dc == 0 and moving in ('up', 'down')):
+                danger = ' [ON YOUR LINE - DODGE sideways NOW]'
+            lines.append(f'  !! enemy bullet at (row {r},col {c}) = {_rel(dr, dc)}, '
+                         f'moving {moving}{danger}.')
         else:
-            moving = 'down' if b.vy > 0 else 'up'
-        lines.append(f'  !! enemy bullet at ({r},{c}) moving {moving}.')
+            lines.append(f'  !! enemy bullet at (row {r},col {c}) moving {moving}.')
     if state.item is not None:
         r = (state.item.y - gs.ARENA) // gs.CELL
         c = (state.item.x - gs.ARENA) // gs.CELL
-        lines.append(f'Power-up ($) at ({r},{c}): {gs.ITEM_NAMES[state.item.kind]}.')
+        lines.append(f'Power-up $ at (row {r},col {c}): {gs.ITEM_NAMES[state.item.kind]}.')
     if state.freeze:
         lines.append('Enemies are FROZEN now - free hits.')
     if state.shield:
-        lines.append('You are temporarily invincible.')
-    lines.append('')
-    lines.append(render_map(state))
-    lines.append('')
-    lines.append('Your move. End with: ACTION: <0-9>  HOLD: <1-6>')
+        lines.append('You are briefly invincible.')
+    if history:
+        lines.append('Your last moves (oldest->newest): ' + ', '.join(history) + '.')
+    lines.append('Local view, 9x9 centred on you (P). E/A=enemy  *=enemy bullet  '
+                 "o=your bullet  $=item  #brick @steel ~water ,ice X=base  .=open  "
+                 '%=arena edge:')
+    lines.append(render_ego(state, radius=4))
+    lines.append('Pick ONE action now. Reply MUST start with: ACTION: <0-9>  HOLD: <1-6>')
     return '\n'.join(lines)
 
 
 class DirectPilot(Commander):
-    """Reuses Commander's HTTP/retry/cost metering; direct-action prompt+parse."""
+    """Reuses Commander's HTTP/retry/cost metering; direct-action prompt+parse.
 
-    def act(self, state_text):
-        # Prefill the assistant turn with "ACTION:" so the model's first emitted
-        # tokens ARE the action - it cannot bury the decision under paragraphs of
-        # analysis and get truncated before committing (observed with Haiku).
+    Representation v2: the big static context (rules + stage terrain map) is sent
+    as cached prefix blocks, so only the small live-state delta is fresh input
+    each turn; the pilot also carries the player's recent action history so the
+    model is aware of its own sequence and can break oscillation loops.
+    """
+
+    def start_episode(self, state):
+        self._static_terrain = render_terrain_static(state)
+        from collections import deque
+        self._history = deque(maxlen=10)
+        self._plan = ''
+        self._subgoal = ''
+        self.cache_read = 0
+        self.cache_write = 0
+        self.fresh_in = 0
+
+    def remember(self, action, hold):
+        label = {0: 'wait', 1: 'up', 2: 'down', 3: 'left', 4: 'right', 5: 'fire',
+                 6: 'fire-up', 7: 'fire-down', 8: 'fire-left',
+                 9: 'fire-right'}.get(action, str(action))
+        if hold > 1:
+            label += f'x{hold}'
+        self._history.append(label)
+
+    def act(self, dynamic_text, include_terrain=True):
+        # Blocks carry cache_control (system + terrain) in case the gateway ever
+        # honours prompt caching; it currently bills every token fresh, so the
+        # global terrain map is only re-sent periodically (the live ego view in
+        # the dynamic block carries current local walls every turn). Prefill
+        # "PLAN:" so the reply is the structured goal/assessment/action block
+        # (macro+micro goals, reason) in a fixed, parseable order.
+        content = []
+        if include_terrain:
+            content.append({'type': 'text',
+                            'text': getattr(self, '_static_terrain', ''),
+                            'cache_control': {'type': 'ephemeral'}})
+        content.append({'type': 'text', 'text': dynamic_text})
         payload = {
-            'model': self.model, 'max_tokens': 24,
+            'model': self.model, 'max_tokens': 170,
             'system': [{'type': 'text', 'text': DIRECT_SYSTEM,
                         'cache_control': {'type': 'ephemeral'}}],
-            'messages': [{'role': 'user', 'content': state_text},
-                         {'role': 'assistant', 'content': 'ACTION:'}],
+            'messages': [
+                {'role': 'user', 'content': content},
+                {'role': 'assistant', 'content': 'PLAN:'},
+            ],
         }
         if 'opus' not in self.model:
             payload['temperature'] = 0.2
-        text = self._post(payload, state_text)
-        return self._parse_action('ACTION:' + text), 'ACTION:' + text
+        reply = 'PLAN:' + self._post(payload, dynamic_text)
+        action, hold = self._parse_action(reply)
+        self._plan = self._extract(reply, 'PLAN') or getattr(self, '_plan', '')
+        self._subgoal = self._extract(reply, 'SUBGOAL') or getattr(self, '_subgoal', '')
+        return (action, hold), reply
+
+    @staticmethod
+    def _extract(text, field):
+        m = re.search(rf'{field}:\s*(.+)', text, re.IGNORECASE)
+        return m.group(1).strip() if m else ''
 
     def _post(self, payload, state_text):
         import urllib.request
@@ -184,6 +357,9 @@ class DirectPilot(Commander):
                       + usage.get('cache_read_input_tokens', 0) * prices[0] * 0.1
                       + usage.get('cache_creation_input_tokens', 0) * prices[0] * 1.25
                       + usage.get('output_tokens', 0) * prices[1]) / 1e6
+        self.cache_read = getattr(self, 'cache_read', 0) + usage.get('cache_read_input_tokens', 0)
+        self.cache_write = getattr(self, 'cache_write', 0) + usage.get('cache_creation_input_tokens', 0)
+        self.fresh_in = getattr(self, 'fresh_in', 0) + usage.get('input_tokens', 0)
         self.calls += 1
         text = ''.join(block.get('text', '') for block in body.get('content', []))
         return text
@@ -218,28 +394,41 @@ def play_direct_episode(stage, *, seed, pilot, max_hold=6, max_calls=4000,
     stats_final = {}
     vetoes = 0
     action, hold_left = 0, 0
+    pilot.start_episode(parser.parse(batch.ram(0)))
     try:
         for step in range(max_frames // 4 + 8):
             ram = batch.ram(0)
             state = parser.parse(ram)
-            # Re-query the model when the hold expires, or immediately if we are
-            # respawning / an enemy bullet is adjacent (safety re-read), as long
-            # as we have budget left.
-            urgent = any(b.owner >= 2 for b in state.bullets)
-            need = hold_left <= 0 or (urgent and hold_left > 0 and action in (0,))
+            kills = int(state.kills)
+            # Re-query the model when the hold expires, or immediately if an enemy
+            # bullet now shares the player's row/column (a new lethal threat the
+            # held action may not be dodging), as long as we have budget left.
+            urgent = state.player is not None and any(
+                b.owner >= 2 and ((b.y - gs.ARENA) // gs.CELL == state.player.tile[0]
+                                  or (b.x - gs.ARENA) // gs.CELL == state.player.tile[1])
+                for b in state.bullets)
+            need = hold_left <= 0 or urgent
             if need and pilot.calls < max_calls and pilot.cost < pilot.budget \
                     and state.player is not None:
-                text = render_direct(state, stage, step * 4)
-                (action, hold), reply = pilot.act(text)
+                text = render_dynamic(state, stage, step * 4,
+                                      list(getattr(pilot, '_history', [])), kills,
+                                      plan=getattr(pilot, '_plan', ''),
+                                      subgoal=getattr(pilot, '_subgoal', ''))
+                (action, hold), reply = pilot.act(
+                    text, include_terrain=(pilot.calls % 25 == 0))
+                pilot.remember(action, hold)
                 hold_left = min(hold, max_hold)
                 pilot.log.write(json.dumps(
                     {'call': pilot.calls, 'step': step, 'cost_usd': round(pilot.cost, 4),
-                     'action': action, 'hold': hold_left, 'reply': reply},
-                    ensure_ascii=False) + '\n')
+                     'kills': kills, 'action': action, 'hold': hold_left,
+                     'cache_read': pilot.cache_read, 'fresh_in': pilot.fresh_in,
+                     'reply': reply}, ensure_ascii=False) + '\n')
                 pilot.log.flush()
                 if verbose:
-                    print(f'  step {step}: action={action} hold={hold_left} '
-                          f'cost=${pilot.cost:.3f}', flush=True)
+                    print(f'  step {step}: kills={kills} action={action} '
+                          f'hold={hold_left} cost=${pilot.cost:.3f} '
+                          f'cache_read={pilot.cache_read} fresh={pilot.fresh_in}',
+                          flush=True)
             hold_left -= 1
             masks = batch.masks()[0].copy()
             chosen = action if masks[action] else 0
