@@ -1,0 +1,314 @@
+"""Pure LLM plays Battle City: the model IS the controller.
+
+Unlike llm_player.py (where the LLM issues strategic orders and a geometric
+HeuristicBot + MPC veto do the actual driving), here the language model picks a
+primitive joypad action (0-9) directly from a textual board every query. There
+is no geometric executor and, by default, no safety veto - the tank does
+exactly and only what the model says. This measures whether Claude can play the
+game itself, not steer a hand-coded pilot.
+
+The model may attach a "hold" count to repeat its action for a few decisions,
+which lets it self-pace and bounds API cost/latency (a stage-1 clear is ~1000
+decisions at 4 frames each). An optional --safety-veto adds the MPC fatal-move
+filter back, purely to quantify how much a safety net would buy.
+
+Rust engine outcomes are not original-ROM wins, but stage-1 geometry/enemy
+behaviour matches the ROM closely enough for a feasibility read.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import re
+import sys
+import time
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import game_state as gs
+from llm_player import Commander, render_map, FACING_NAMES
+from mpc_teacher import MpcVetoTeacher, CachedParser, outcome_of
+from rust_env import NativeBatch, episode_seed, stage_ram
+
+# action id -> human label; matches the Rust NativeBatch 10-action space.
+ACTION_LABELS = {
+    0: 'wait (no move, no fire)',
+    1: 'move/face UP',
+    2: 'move/face DOWN',
+    3: 'move/face LEFT',
+    4: 'move/face RIGHT',
+    5: 'FIRE in the direction you currently face',
+    6: 'turn to face UP and FIRE',
+    7: 'turn to face DOWN and FIRE',
+    8: 'turn to face LEFT and FIRE',
+    9: 'turn to face RIGHT and FIRE',
+}
+
+DIRECT_SYSTEM = """\
+You are directly driving the player tank in NES Battle City, one joypad action
+at a time. The arena is a 26x26 grid of cells shown to you as text each turn.
+You win by destroying all 20 enemy tanks before you run out of lives. You lose
+instantly if an enemy tank or an enemy bullet reaches your base (marked X at
+the bottom centre, rows 24-25 cols 12-13), so defending it always outranks
+grabbing items or chasing kills.
+
+You output ONE primitive action per turn. The ten actions are:
+  0 = wait (do nothing)
+  1 = move/face UP        2 = move/face DOWN
+  3 = move/face LEFT      4 = move/face RIGHT
+  5 = FIRE straight ahead (in the direction you currently face)
+  6 = face UP and fire    7 = face DOWN and fire
+  8 = face LEFT and fire  9 = face RIGHT and fire
+
+Movement rules: actions 1-4 move you one step AND turn you to face that way; a
+tank only moves in the direction it faces. To shoot an enemy you must face it
+(its row or column must line up with yours, nothing solid between) and fire -
+use 6/7/8/9 to aim-and-shoot in one action, or 5 if you already face the
+target. Your own bullet is 'o'; only one of your bullets exists at a time, so
+don't spam fire. Enemy bullets are '*' and kill you in one hit - step out of
+their row/column to dodge. '#' brick is destructible by shots and blocks
+movement; '@' steel and '~' water block movement; ',' ice makes you slide.
+
+Answer FORMAT - this is strict. Your reply MUST BEGIN with the action line,
+exactly:
+ACTION: <n>  HOLD: <h>
+where <n> is 0-9 and <h> is 1-6 = how many turns to repeat this action before
+you look again (larger HOLD for long straight travel through open space, HOLD 1
+when enemies or bullets are near and you must react every step). You MAY add at
+most ONE short clause of reasoning AFTER that line, never before it. Decide
+fast; the action line comes first, always."""
+
+
+def render_direct(state, stage, frame):
+    """Compact board + status + reminder, framed for single-action control."""
+    lines = [f'Stage {stage}, frame {frame} (~{frame // 60}s into the stage).']
+    player = state.player
+    if player is not None:
+        pr, pc = player.tile
+        lines.append(f'You (P) are at cell ({pr},{pc}), facing '
+                     f'{FACING_NAMES[player.facing]}, power {player.power}, '
+                     f'lives left {state.lives}.')
+    else:
+        lines.append(f'You are respawning this turn. Lives left {state.lives}.')
+    on_field = len(state.enemies)
+    lines.append(f'{state.remaining_enemies} enemy tanks still to kill '
+                 f'({on_field} on screen now, {state.spawn_left} not yet spawned).')
+    for enemy in state.enemies:
+        r, c = enemy.tile
+        base_d = abs(r - 25) + abs(c - 12)
+        extra = ' ARMORED' if enemy.armor > 1 else ''
+        carry = ' (carries item)' if enemy.drops_item else ''
+        lines.append(f'  enemy{extra} at ({r},{c}) facing '
+                     f'{FACING_NAMES[enemy.facing]}, {base_d} cells from your '
+                     f'base{carry}.')
+    threats = [b for b in state.bullets if b.owner >= 2]
+    for b in threats:
+        r, c = (b.y - gs.ARENA) // gs.CELL, (b.x - gs.ARENA) // gs.CELL
+        if abs(b.vx) >= abs(b.vy):
+            moving = 'right' if b.vx > 0 else 'left'
+        else:
+            moving = 'down' if b.vy > 0 else 'up'
+        lines.append(f'  !! enemy bullet at ({r},{c}) moving {moving}.')
+    if state.item is not None:
+        r = (state.item.y - gs.ARENA) // gs.CELL
+        c = (state.item.x - gs.ARENA) // gs.CELL
+        lines.append(f'Power-up ($) at ({r},{c}): {gs.ITEM_NAMES[state.item.kind]}.')
+    if state.freeze:
+        lines.append('Enemies are FROZEN now - free hits.')
+    if state.shield:
+        lines.append('You are temporarily invincible.')
+    lines.append('')
+    lines.append(render_map(state))
+    lines.append('')
+    lines.append('Your move. End with: ACTION: <0-9>  HOLD: <1-6>')
+    return '\n'.join(lines)
+
+
+class DirectPilot(Commander):
+    """Reuses Commander's HTTP/retry/cost metering; direct-action prompt+parse."""
+
+    def act(self, state_text):
+        # Prefill the assistant turn with "ACTION:" so the model's first emitted
+        # tokens ARE the action - it cannot bury the decision under paragraphs of
+        # analysis and get truncated before committing (observed with Haiku).
+        payload = {
+            'model': self.model, 'max_tokens': 24,
+            'system': [{'type': 'text', 'text': DIRECT_SYSTEM,
+                        'cache_control': {'type': 'ephemeral'}}],
+            'messages': [{'role': 'user', 'content': state_text},
+                         {'role': 'assistant', 'content': 'ACTION:'}],
+        }
+        if 'opus' not in self.model:
+            payload['temperature'] = 0.2
+        text = self._post(payload, state_text)
+        return self._parse_action('ACTION:' + text), 'ACTION:' + text
+
+    def _post(self, payload, state_text):
+        import urllib.request
+        import urllib.error
+        from llm_player import ANTHROPIC_VERSION
+        data = json.dumps(payload).encode()
+        headers = {'content-type': 'application/json',
+                   'anthropic-version': ANTHROPIC_VERSION,
+                   'authorization': f'Bearer {self.token}',
+                   'x-api-key': self.token}
+        url = self.base_url + '/v1/messages'
+        last_error = None
+        body = None
+        for attempt in range(6):
+            try:
+                request = urllib.request.Request(url, data=data, headers=headers)
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    body = json.load(response)
+                break
+            except urllib.error.HTTPError as error:
+                last_error = error
+                location = error.headers.get('Location') if error.headers else None
+                if error.code in (301, 302, 307, 308) and location \
+                        and location.startswith('https://'):
+                    url = location
+                time.sleep(8 * (attempt + 1))
+            except Exception as error:  # noqa: BLE001 - retry then surface
+                last_error = error
+                time.sleep(8 * (attempt + 1))
+        if body is None:
+            raise RuntimeError(f'LLM call failed after retries: {last_error}')
+        usage = body.get('usage', {})
+        prices = __import__('llm_player').PRICES.get(self.model, (3.0, 15.0))
+        self.cost += (usage.get('input_tokens', 0) * prices[0]
+                      + usage.get('cache_read_input_tokens', 0) * prices[0] * 0.1
+                      + usage.get('cache_creation_input_tokens', 0) * prices[0] * 1.25
+                      + usage.get('output_tokens', 0) * prices[1]) / 1e6
+        self.calls += 1
+        text = ''.join(block.get('text', '') for block in body.get('content', []))
+        return text
+
+    @staticmethod
+    def _parse_action(text):
+        """Return (action 0-9, hold 1-6). Tolerant of format drift."""
+        action, hold = 0, 1
+        m = re.search(r'ACTION:\s*([0-9])', text, re.IGNORECASE)
+        if m:
+            action = int(m.group(1))
+        else:  # fall back to the last bare digit 0-9 in the reply
+            digits = re.findall(r'\b([0-9])\b', text)
+            if digits:
+                action = int(digits[-1])
+        h = re.search(r'HOLD:\s*([1-9])', text, re.IGNORECASE)
+        if h:
+            hold = max(1, min(6, int(h.group(1))))
+        return action, hold
+
+
+def play_direct_episode(stage, *, seed, pilot, max_hold=6, max_calls=4000,
+                        max_frames=12000, use_veto=False, depth=12, plan_seeds=3,
+                        verbose=False):
+    ram0 = stage_ram(stage, seed=0)
+    batch = NativeBatch(ram0[None], max_frames, seeds=[seed])
+    batch.observe()
+    parser = CachedParser()
+    planner = MpcVetoTeacher(depth=depth, plan_seeds=plan_seeds,
+                             plan_rng_seed=seed & 0xffffffff) if use_veto else None
+    outcome = 'incomplete'
+    stats_final = {}
+    vetoes = 0
+    action, hold_left = 0, 0
+    try:
+        for step in range(max_frames // 4 + 8):
+            ram = batch.ram(0)
+            state = parser.parse(ram)
+            # Re-query the model when the hold expires, or immediately if we are
+            # respawning / an enemy bullet is adjacent (safety re-read), as long
+            # as we have budget left.
+            urgent = any(b.owner >= 2 for b in state.bullets)
+            need = hold_left <= 0 or (urgent and hold_left > 0 and action in (0,))
+            if need and pilot.calls < max_calls and pilot.cost < pilot.budget \
+                    and state.player is not None:
+                text = render_direct(state, stage, step * 4)
+                (action, hold), reply = pilot.act(text)
+                hold_left = min(hold, max_hold)
+                pilot.log.write(json.dumps(
+                    {'call': pilot.calls, 'step': step, 'cost_usd': round(pilot.cost, 4),
+                     'action': action, 'hold': hold_left, 'reply': reply},
+                    ensure_ascii=False) + '\n')
+                pilot.log.flush()
+                if verbose:
+                    print(f'  step {step}: action={action} hold={hold_left} '
+                          f'cost=${pilot.cost:.3f}', flush=True)
+            hold_left -= 1
+            masks = batch.masks()[0].copy()
+            chosen = action if masks[action] else 0
+            if planner is not None:
+                scores, unsafe = planner.plan(ram[None])
+                safe = int(planner.choose(scores, unsafe, [masks], [chosen])[0])
+                if safe != chosen:
+                    vetoes += 1
+                chosen = safe
+            _, _, dones, stats = batch.step(np.array([chosen]))
+            if dones[0]:
+                final_ram = batch.ram(0)
+                outcome = outcome_of(final_ram)
+                frame, kills, deaths, shots, pickups = map(int, stats[0])
+                stats_final = {'frames': frame, 'kills': kills, 'deaths': deaths,
+                               'shots': shots, 'pickups': pickups}
+                break
+            if pilot.cost >= pilot.budget:
+                outcome = 'budget_exhausted'
+                break
+    finally:
+        batch.close()
+    return {'stage': stage, 'seed': seed, 'outcome': outcome, **stats_final,
+            'llm_calls': pilot.calls, 'vetoes': vetoes,
+            'cost_usd': round(pilot.cost, 4)}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage', type=int, default=1)
+    parser.add_argument('--episodes', type=int, default=1)
+    parser.add_argument('--base-seed', type=int, default=90000)
+    parser.add_argument('--model', default='claude-haiku-4-5')
+    parser.add_argument('--base-url',
+                        default='https://pkzzhbqc-23461.jpe1.devtunnels.ms')
+    parser.add_argument('--token', default='local-dev-key')
+    parser.add_argument('--budget-usd', type=float, default=20.0)
+    parser.add_argument('--max-hold', type=int, default=6)
+    parser.add_argument('--max-calls', type=int, default=4000)
+    parser.add_argument('--safety-veto', action='store_true',
+                        help='add the MPC fatal-move filter back (not pure LLM)')
+    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args(argv)
+    args.output.mkdir(parents=True, exist_ok=True)
+    results = []
+    for episode in range(args.episodes):
+        pilot = DirectPilot(args.base_url, args.token, args.model,
+                            args.budget_usd, args.output / 'transcript.jsonl')
+        result = play_direct_episode(
+            args.stage, seed=episode_seed(args.base_seed, args.stage, episode),
+            pilot=pilot, max_hold=args.max_hold, max_calls=args.max_calls,
+            use_veto=args.safety_veto, verbose=args.verbose)
+        results.append(result)
+        print(json.dumps(result), flush=True)
+        pilot.log.close()
+    summary = {
+        'model': args.model, 'stage': args.stage, 'pure_llm': not args.safety_veto,
+        'clears': sum(r['outcome'] == 'clear' for r in results),
+        'episodes': len(results),
+        'total_cost_usd': round(sum(r['cost_usd'] for r in results), 4),
+        'results': results,
+    }
+    (args.output / 'summary.json').write_text(json.dumps(summary, indent=2),
+                                              encoding='utf-8')
+    print(json.dumps({k: summary[k] for k in
+                      ('model', 'stage', 'pure_llm', 'clears', 'episodes',
+                       'total_cost_usd')}))
+
+
+if __name__ == '__main__':
+    main()
