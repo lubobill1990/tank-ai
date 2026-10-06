@@ -27,16 +27,17 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from battle_city_env import BattleCityEnv, CHANNEL_NAMES, ENV_VERSION
 from experiments import integer_list, sha256, write_json
 from policy import Grid26CNN
-from rust_env import (BACKEND_VERSION, RNG_VERSION, SEED_VERSION, RustVectorEnv,
-                      native_library, stage_ram)
+from rust_env import (BACKEND_VERSION, RNG_BACKENDS, SEED_VERSION,
+                      RustVectorEnv, ScratchTrace, native_library, stage_ram)
 
 ROOT = Path(__file__).parent
 CODECS = ('dense', 'zlib', 'native', 'cuda')
 
 
-def contract():
+def contract(rng_backend='splitmix'):
     return {
-        'backend': BACKEND_VERSION, 'rng': RNG_VERSION, 'seed_derivation': SEED_VERSION,
+        'backend': BACKEND_VERSION, 'rng': RNG_BACKENDS[rng_backend],
+        'seed_derivation': SEED_VERSION,
         'actions': 10, 'observation_shape': [94, 26, 26], 'channels': list(CHANNEL_NAMES),
         'n_stack': 2, 'frame_skip': 4, 'reward': 'sparse-kill1-death-3-base-20-clear5-frame-0.0005',
         'termination': 'full-stage-multi-life-v1',
@@ -44,7 +45,7 @@ def contract():
 
 
 def validate_manifest(manifest):
-    if manifest.get('contract') != contract():
+    if manifest.get('contract') not in [contract(backend) for backend in sorted(RNG_BACKENDS)]:
         raise ValueError('Incompatible native model manifest (backend/RNG/actions/observations/episode rules)')
 
 
@@ -67,6 +68,11 @@ def parse_args(argv=None):
         sub.add_argument('--max-storage-mib', type=int, default=2048)
         sub.add_argument('--plain-batch', action='store_true',
                          help='Diagnostic baseline: separate native status/mask calls')
+        # cartridge is the measured default: in the 2026-10 RNG ablation its ROM
+        # transfer matched direct-ROM training and beat splitmix (docs/rust_backend.md).
+        sub.add_argument('--rng-backend', choices=tuple(sorted(RNG_BACKENDS)), default='cartridge')
+        sub.add_argument('--scratch-trace', type=Path, default=None,
+                         help='Recorded cartridge scratch replay (.npz from scratch_capture.py)')
     sub = commands.add_parser('eval')
     sub.add_argument('--model', type=Path, required=True)
     sub.add_argument('--output', type=Path, required=True)
@@ -93,6 +99,8 @@ def parse_args(argv=None):
             parser.error('cuda decoding requires --device cuda')
         if args.command == 'compare' and args.codec == 'dense':
             parser.error('compare requires a compact codec')
+        if args.scratch_trace is not None and args.rng_backend != 'cartridge':
+            parser.error('--scratch-trace requires --rng-backend cartridge')
     elif any(not 0 <= seed < 2**32 for seed in args.seeds):
         parser.error('seeds must fit uint32')
     return args
@@ -173,20 +181,25 @@ def train(args):
     args.output.mkdir(parents=True, exist_ok=False)
     sources = {str(path.relative_to(ROOT)): sha256(path) for path in
                sorted((ROOT / 'native' / 'src').glob('*.rs'))}
+    scratch = ScratchTrace.load(args.scratch_trace) if args.scratch_trace is not None else None
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     manifest = {
-        'contract': contract(), 'training': config, 'native_source_sha256': sources,
+        'contract': contract(args.rng_backend), 'training': config, 'native_source_sha256': sources,
         'native_library_sha256': sha256(lib._name), 'rom_sha256': sha256(ROOT / 'battle_city.nes'),
         'rom_observer_version': ENV_VERSION, 'torch': torch.__version__, 'numpy': np.__version__,
         'resume_supported': False, 'independent_rom_parity': False,
-        'seed_schedule': 'SHA256(tank-ai-episode-v1:seed+env_index:env_index:episode), first 8 bytes LE',
+        'seed_schedule': 'SHA256(tank-ai-episode-v1:seed+env_index:env_index:episode), first 8 bytes LE'
+                         + (', expanded to cartridge $0F/$10/scratch phase'
+                            if args.rng_backend == 'cartridge' else ''),
+        'scratch_trace_sha256': scratch.sha256 if scratch is not None else None,
     }
     write_json(args.output / 'config.json', manifest)
     snapshots = [stage_ram(stage, seed=args.seed) for stage in args.stages]
     initial = np.stack([snapshots[i % len(snapshots)] for i in range(args.envs)])
     manifest['initial_ram_sha256'] = [hashlib.sha256(row.tobytes()).hexdigest() for row in initial]
     vec = VecFrameStack(RustVectorEnv(initial, args.max_frames, seed=args.seed,
-                                    fast=not args.plain_batch), n_stack=2, channels_order='first')
+                                    fast=not args.plain_batch, rng_backend=args.rng_backend,
+                                    scratch=scratch), n_stack=2, channels_order='first')
     try:
         model = MaskablePPO(
             'CnnPolicy', vec, seed=args.seed, device=args.device, n_steps=args.n_steps,
@@ -315,8 +328,10 @@ def compare(args):
                    '--output', str(output), '--codec', codec, '--device', args.device,
                    '--stages', ','.join(map(str, args.stages))]
         for option in ('steps', 'envs', 'n_steps', 'batch_size', 'epochs',
-                       'max_frames', 'seed', 'max_storage_mib'):
+                       'max_frames', 'seed', 'max_storage_mib', 'rng_backend'):
             command.extend(['--' + option.replace('_', '-'), str(getattr(args, option))])
+        if args.scratch_trace is not None:
+            command.extend(['--scratch-trace', str(args.scratch_trace.resolve())])
         if args.plain_batch:
             command.append('--plain-batch')
         subprocess.run(command, cwd=ROOT, check=True)

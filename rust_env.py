@@ -10,6 +10,8 @@ from stable_baselines3.common.vec_env import VecEnv
 
 BACKEND_VERSION = 'rust-seeded-experimental-v1'
 RNG_VERSION = 'splitmix64-top-byte-v1'
+CARTRIDGE_RNG_VERSION = 'cartridge-rng-v1'
+RNG_BACKENDS = {'splitmix': RNG_VERSION, 'cartridge': CARTRIDGE_RNG_VERSION}
 SEED_VERSION = 'sha256-episode-v1'
 CHANNELS = 47
 U8P = ct.POINTER(ct.c_uint8)
@@ -32,6 +34,53 @@ def episode_seed(seed, stream, episode):
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], 'little')
 
 
+def overlay_allowed(address):
+    """Python mirror of the native scratch deny mask; the native build re-enforces it."""
+    address = _uint(address, 'address', 8)
+    denied = (
+        address in (0x00, 0x06, 0x08, 0x0a, 0x0b, 0x0f, 0x10, 0x11, 0x12)
+        or 0x13 <= address <= 0x22
+        or address in (0x45, 0x46, 0x49)
+        or 0x51 <= address <= 0x5b
+        or address in (0x62, 0x6a, 0x6c)
+        or 0x64 <= address <= 0x68
+        or 0x6f <= address <= 0x76
+        or 0x7f <= address <= 0xef
+    )
+    return not denied
+
+
+class ScratchTrace:
+    """Recorded per-frame non-gameplay zero-page rows for cartridge-rng-v1 replay."""
+    __slots__ = ('addresses', 'values', 'sha256')
+
+    def __init__(self, addresses, values):
+        addresses = np.ascontiguousarray(addresses)
+        values = np.ascontiguousarray(values)
+        if addresses.dtype != np.uint8 or values.dtype != np.uint8:
+            raise ValueError('scratch trace arrays must be uint8')
+        if addresses.ndim != 1 or len(np.unique(addresses)) != len(addresses):
+            raise ValueError('scratch addresses must be unique and one-dimensional')
+        if any(not overlay_allowed(int(a)) for a in addresses):
+            raise ValueError('scratch addresses collide with mirrored gameplay state')
+        if values.ndim != 2 or values.shape[1] != len(addresses) or \
+                (len(addresses) > 0) != (values.shape[0] > 0):
+            raise ValueError('scratch values must be rows matching the address list')
+        self.addresses, self.values = addresses, values
+        digest = hashlib.sha256(b'scratch-trace-v1')
+        digest.update(addresses.tobytes())
+        digest.update(values.tobytes())
+        self.sha256 = digest.hexdigest()
+
+    @classmethod
+    def load(cls, path):
+        with np.load(path) as data:
+            return cls(data['addresses'], data['values'])
+
+    def save(self, path):
+        np.savez_compressed(path, addresses=self.addresses, values=self.values)
+
+
 @lru_cache(maxsize=1)
 def native_library():
     path = Path(__file__).parent / 'native' / 'target' / 'release' / 'battle_mirror_probe.dll'
@@ -40,8 +89,12 @@ def native_library():
     lib = ct.CDLL(str(path))
     signatures = {
         'mirror_rng_version': ([], ct.c_uint32),
+        'mirror_cartridge_rng_version': ([], ct.c_uint32),
         'mirror_diagnostic_build': ([], ct.c_uint32),
         'mirror_create_seeded': ([U8P, ct.c_size_t, ct.c_uint32, U64P], ct.c_void_p),
+        'mirror_create_cartridge': (
+            [U8P, ct.c_size_t, ct.c_uint32, U64P, U8P, ct.c_size_t, U8P, ct.c_size_t],
+            ct.c_void_p),
         'mirror_reset_seeded': ([ct.c_void_p, ct.c_size_t, ct.c_uint64, F32P], ct.c_int32),
         'mirror_close': ([ct.c_void_p], None),
         'mirror_ram': ([ct.c_void_p, ct.c_size_t, U8P], ct.c_int32),
@@ -59,6 +112,8 @@ def native_library():
         raise RuntimeError('Training rejects reference-rng diagnostic builds; rebuild without that feature')
     if lib.mirror_rng_version() != 1:
         raise RuntimeError('Unsupported native RNG version; rebuild the matching backend')
+    if lib.mirror_cartridge_rng_version() != 1:
+        raise RuntimeError('Unsupported native cartridge RNG version; rebuild the matching backend')
     return lib
 
 
@@ -78,11 +133,18 @@ def stage_ram(stage, seed=0):
 
 class NativeBatch:
     """Reusable native buffers; callers must copy arrays they retain across calls."""
-    def __init__(self, initial, max_frames=12000, *, seeds, fast=True):
+    def __init__(self, initial, max_frames=12000, *, seeds, fast=True,
+                 rng_backend='splitmix', scratch=None):
         initial = np.asarray(initial)
         if initial.dtype != np.uint8 or initial.ndim != 2 or initial.shape[1] != 2048 \
                 or not 1 <= len(initial) <= 4096:
             raise ValueError('initial must be uint8 RAM with shape (1..4096, 2048)')
+        if rng_backend not in RNG_BACKENDS:
+            raise ValueError(f'rng_backend must be one of {sorted(RNG_BACKENDS)}')
+        if scratch is not None and rng_backend != 'cartridge':
+            raise ValueError('scratch replay requires the cartridge backend')
+        if scratch is not None and not isinstance(scratch, ScratchTrace):
+            raise ValueError('scratch must be a ScratchTrace')
         self.n = len(initial)
         self.max_frames = _uint(max_frames, 'max_frames', 32)
         if not self.max_frames:
@@ -92,8 +154,18 @@ class NativeBatch:
             raise ValueError('One seed is required per environment')
         initial = np.ascontiguousarray(initial)
         self.lib, self.fast = native_library(), bool(fast)
-        self.handle = self.lib.mirror_create_seeded(
-            initial.ctypes.data_as(U8P), self.n, self.max_frames, seeds.ctypes.data_as(U64P))
+        self.rng_backend, self.scratch = rng_backend, scratch
+        if rng_backend == 'cartridge':
+            addresses = scratch.addresses if scratch is not None else np.empty(0, np.uint8)
+            values = scratch.values if scratch is not None else np.empty((0, 0), np.uint8)
+            self.handle = self.lib.mirror_create_cartridge(
+                initial.ctypes.data_as(U8P), self.n, self.max_frames,
+                seeds.ctypes.data_as(U64P),
+                addresses.ctypes.data_as(U8P), addresses.size,
+                values.ctypes.data_as(U8P), values.size)
+        else:
+            self.handle = self.lib.mirror_create_seeded(
+                initial.ctypes.data_as(U8P), self.n, self.max_frames, seeds.ctypes.data_as(U64P))
         if not self.handle:
             raise RuntimeError('Rust rejected seeded batch initialization')
         self.obs = np.empty((self.n, CHANNELS, 26, 26), np.float32)
@@ -186,13 +258,15 @@ class NativeBatch:
 
 
 class RustVectorEnv(VecEnv):
-    def __init__(self, initial, max_frames=12000, *, seed=0, fast=True):
+    def __init__(self, initial, max_frames=12000, *, seed=0, fast=True,
+                 rng_backend='splitmix', scratch=None):
         seed = _uint(seed, 'seed')
         n = len(initial)
         self._base_seeds = [seed] * n
         self._episodes = [0] * n
         self.batch = NativeBatch(initial, max_frames,
-                                 seeds=[episode_seed(seed, i, 0) for i in range(n)], fast=fast)
+                                 seeds=[episode_seed(seed, i, 0) for i in range(n)], fast=fast,
+                                 rng_backend=rng_backend, scratch=scratch)
         self.render_mode = None
         self._actions = None
         self._returns = np.zeros(n, np.float64)

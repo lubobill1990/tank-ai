@@ -153,6 +153,49 @@ fn seeded_abi_reset_reseeds_and_legacy_reset_preserves_mode() {
 }
 
 #[test]
+fn cartridge_abi_validates_scratch_phases_reseeds_and_reports_version() {
+    assert_eq!(mirror_cartridge_rng_version(), 1);
+    let r = enemies();
+    let seed = 0u64;
+    let denied = [0x0fu8];
+    let pair = [0x5cu8, 0x5d];
+    let ragged = [1u8, 2, 3];
+    unsafe {
+        assert!(mirror_create_cartridge(
+            r.as_ptr(), 1, 100, &seed, denied.as_ptr(), 1, ragged.as_ptr(), 1,
+        ).is_null());
+        assert!(mirror_create_cartridge(
+            r.as_ptr(), 1, 100, &seed, pair.as_ptr(), 2, ragged.as_ptr(), 3,
+        ).is_null());
+        assert!(mirror_create_cartridge(
+            null(), 1, 100, &seed, pair.as_ptr(), 2, ragged.as_ptr(), 0,
+        ).is_null());
+    }
+    let addresses = [0x5cu8];
+    let rows = [9u8, 8];
+    let handle = Handle(unsafe {
+        mirror_create_cartridge(r.as_ptr(), 1, 100, &seed, addresses.as_ptr(), 1, rows.as_ptr(), 2)
+    });
+    assert!(!handle.0.is_null());
+    let mut out = Output::new(1);
+    assert_eq!(out.step(&handle, &[9], true), 0);
+    assert_eq!(out.support, [0]);
+    let after = ram(&handle, 0);
+    assert!(matches!(after[0x5c], 8 | 9));
+    unsafe { assert_eq!(mirror_reset(handle.0, 0, out.obs.as_mut_ptr()), 0); }
+    out.step(&handle, &[9], true);
+    assert_eq!(ram(&handle, 0), after);
+    unsafe { assert_eq!(mirror_reset_seeded(handle.0, 0, 7, out.obs.as_mut_ptr()), 0); }
+    let reseeded = ram(&handle, 0);
+    assert_ne!(
+        (reseeded[0x0f], reseeded[0x10]),
+        (after[0x0f], after[0x10]),
+    );
+    out.step(&handle, &[9], true);
+    assert_ne!(ram(&handle, 0), after);
+}
+
+#[test]
 fn fused_step_matches_separate_step_support_and_masks_for_both_modes() {
     let data = [enemies(), scene()].concat();
     for is_seeded in [false, true] {

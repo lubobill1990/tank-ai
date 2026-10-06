@@ -1,6 +1,7 @@
 //! RAM mirror ABI: legacy parity probes and explicitly seeded experimental play.
 //! Diagnostic builds expose their status and must not be used for training.
 mod engine;
+mod cartridge;
 mod codec;
 mod extras;
 mod observe;
@@ -25,6 +26,11 @@ struct Batch {
 /// SplitMix64-v1, using the high byte of each complete 64-bit output.
 #[unsafe(no_mangle)]
 pub extern "C" fn mirror_rng_version() -> u32 { 1 }
+
+/// cartridge-rng-v1: the cartridge $D44D arithmetic over mirrored zero page,
+/// seed-derived $0F/$10/scratch phase, optional recorded scratch replay.
+#[unsafe(no_mangle)]
+pub extern "C" fn mirror_cartridge_rng_version() -> u32 { 1 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mirror_diagnostic_build() -> u32 {
@@ -142,6 +148,52 @@ pub unsafe extern "C" fn mirror_create_seeded(
         let mut initial = [0; engine::RAM_LEN];
         initial.copy_from_slice(r);
         Engine::new_seeded(initial, seed)
+    }).collect();
+    Box::into_raw(Box::new(Batch {
+        engines, max_frames, stop_on_death: false, terminal: vec![false; count],
+    })).cast()
+}
+
+/// Opt-in experimental cartridge-formula randomness: $D44D arithmetic over the
+/// mirrored zero page, seed-derived phase, optional recorded scratch replay.
+/// The scratch rows are row-major `[row_count][address_count]` boundary
+/// captures; addresses colliding with mirrored gameplay state are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mirror_create_cartridge(
+    ram: *const u8, count: usize, max_frames: u32, seeds: *const u64,
+    scratch_addresses: *const u8, address_count: usize,
+    scratch_values: *const u8, value_count: usize,
+) -> *mut std::ffi::c_void {
+    if ram.is_null() || seeds.is_null() || count == 0 || count > 4096 || max_frames == 0 {
+        return std::ptr::null_mut();
+    }
+    if (address_count != 0 && scratch_addresses.is_null())
+        || (value_count != 0 && scratch_values.is_null())
+        || address_count > 256
+        || value_count > 1 << 26
+    {
+        return std::ptr::null_mut();
+    }
+    let addresses = if address_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(scratch_addresses, address_count) }.to_vec()
+    };
+    let values = if value_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(scratch_values, value_count) }.to_vec()
+    };
+    let Ok(trace) = cartridge::ScratchTrace::new(addresses, values) else {
+        return std::ptr::null_mut();
+    };
+    let trace = std::sync::Arc::new(trace);
+    let data = unsafe { slice::from_raw_parts(ram, count * engine::RAM_LEN) };
+    let seeds = unsafe { slice::from_raw_parts(seeds, count) };
+    let engines = data.chunks_exact(engine::RAM_LEN).zip(seeds).map(|(r, &seed)| {
+        let mut initial = [0; engine::RAM_LEN];
+        initial.copy_from_slice(r);
+        Engine::new_cartridge(initial, seed, trace.clone())
     }).collect();
     Box::into_raw(Box::new(Batch {
         engines, max_frames, stop_on_death: false, terminal: vec![false; count],

@@ -71,11 +71,36 @@ class RustTrainingTests(unittest.TestCase):
     def test_manifest_rejects_old_action_contract(self):
         manifest = {'contract': contract()}
         validate_manifest(manifest)
+        validate_manifest({'contract': contract('cartridge')})
+        self.assertEqual(contract()['rng'], 'splitmix64-top-byte-v1')
+        self.assertEqual(contract('cartridge')['rng'], 'cartridge-rng-v1')
         for key, value in (('actions', 15), ('rng', 'rom-equivalent'),
                            ('observation_shape', [47, 26, 26]), ('seed_derivation', 'unknown')):
             bad = {'contract': {**manifest['contract'], key: value}}
             with self.assertRaises(ValueError):
                 validate_manifest(bad)
+
+    def test_cartridge_training_records_rng_backend_and_scratch_hash(self):
+        from rust_env import ScratchTrace
+        with tempfile.TemporaryDirectory() as temp:
+            trace = ScratchTrace(np.array([0x5c], np.uint8), np.array([[9], [8]], np.uint8))
+            trace_path = Path(temp) / 'trace.npz'
+            trace.save(trace_path)
+            self.assertEqual(parse_args(['train', '--output', 'unused']).rng_backend, 'cartridge')
+            with self.assertRaises(SystemExit):
+                parse_args(['train', '--output', 'unused', '--rng-backend', 'splitmix',
+                            '--scratch-trace', str(trace_path)])
+            output = Path(temp) / 'run'
+            args = parse_args(['train', '--output', str(output), '--codec', 'dense',
+                               '--steps', '4', '--envs', '2', '--n-steps', '2',
+                               '--batch-size', '4', '--epochs', '1', '--max-frames', '4',
+                               '--rng-backend', 'cartridge', '--scratch-trace', str(trace_path)])
+            train(args)
+            manifest = json.loads((output / 'manifest.json').read_text(encoding='utf-8'))
+            validate_manifest(manifest)
+            self.assertEqual(manifest['contract']['rng'], 'cartridge-rng-v1')
+            self.assertEqual(manifest['scratch_trace_sha256'], trace.sha256)
+            self.assertIn('cartridge $0F/$10/scratch phase', manifest['seed_schedule'])
 
     def test_comparison_resolves_output_in_callers_working_directory(self):
         root = Path(__file__).parent

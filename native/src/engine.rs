@@ -8,12 +8,16 @@ pub const SUPPORTED: &str = "Verified no-spawn skill scenes after two neutral NE
     delayed controller input, player movement/turns, projectiles, residual bricks, \
     frozen targets, bullet cancellation, armor, pickups, timed fortress, ice coasting and death events. \
     Cartridge-derived enemy state machine, fire, spawning and drops have conditional RNG parity. \
-    Seeded experimental mode acknowledges these mechanics and ice, using SplitMix64-v1, not NES RNG.";
+    Seeded experimental modes acknowledge these mechanics and ice: SplitMix64-v1 independent \
+    draws, or cartridge-rng-v1 running the cartridge $D44D arithmetic over the mirrored zero \
+    page with seed-derived phase and optional recorded scratch replay. Neither is NES RNG.";
 pub const LIMITATIONS: &str = "Not a NES emulator. Legacy enemy/spawn/drop flags remain unsupported: \
     the exact RNG reads transient zero-page audio/NMI scratch not reconstructed by this RAM-only mirror. \
     Long host-frame traces also exhibit preterminal 0/2 tick deltas; NMI/host-frame phase is not modeled. \
     Legacy ice remains flagged pending long-trajectory validation despite bounded movement parity. \
     Seeded experimental trajectories are reproducible, not emulator-equivalent. \
+    Cartridge-mode scratch replay uses per-frame boundary captures of non-gameplay zero page, \
+    not instruction-interleaved audio/NMI writes, and its distribution remains unvalidated. \
     No menus, terminal-state continuation, stage transition, PPU/audio, or autonomous aligned drops. \
     Raw RAM outside modeled fields is retained, not emulated. \
     Call unsupported() to detect unsupported scene mechanics encountered.";
@@ -43,6 +47,28 @@ impl SeededRng {
     }
 }
 
+/// Training randomness backends. Legacy keeps the restrictive parity flags;
+/// both seeded variants explicitly accept enemy/spawn/drop/ice mechanics.
+enum RngMode {
+    Legacy,
+    SplitMix(SeededRng),
+    Cartridge(crate::cartridge::CartridgeRng),
+}
+
+impl RngMode {
+    /// Fresh copy with the original seed, for episode resets.
+    fn restarted(&self) -> Self {
+        match self {
+            Self::Legacy => Self::Legacy,
+            Self::SplitMix(rng) => Self::SplitMix(SeededRng { seed: rng.seed, state: rng.seed }),
+            Self::Cartridge(rng) => Self::Cartridge(crate::cartridge::CartridgeRng::new(
+                rng.seed,
+                rng.trace.clone(),
+            )),
+        }
+    }
+}
+
 pub struct Engine {
     pub ram: [u8; RAM_LEN],
     pub frame: u32,
@@ -54,21 +80,32 @@ pub struct Engine {
     pending_input: u8,
     last_input: u8,
     unsupported: u32,
-    seeded_rng: Option<SeededRng>,
+    rng: RngMode,
     #[cfg(feature = "reference-rng")]
     reference_rng: Option<crate::random_replay::RandomReplay>,
 }
 
 impl Engine {
     pub fn new(ram: [u8; RAM_LEN]) -> Self {
-        Self::with_seed(ram, None)
+        Self::with_rng(ram, RngMode::Legacy)
     }
 
     pub fn new_seeded(ram: [u8; RAM_LEN], seed: u64) -> Self {
-        Self::with_seed(ram, Some(seed))
+        Self::with_rng(ram, RngMode::SplitMix(SeededRng { seed, state: seed }))
     }
 
-    fn with_seed(ram: [u8; RAM_LEN], seed: Option<u64>) -> Self {
+    pub fn new_cartridge(
+        ram: [u8; RAM_LEN],
+        seed: u64,
+        trace: std::sync::Arc<crate::cartridge::ScratchTrace>,
+    ) -> Self {
+        Self::with_rng(
+            ram,
+            RngMode::Cartridge(crate::cartridge::CartridgeRng::new(seed, trace)),
+        )
+    }
+
+    fn with_rng(ram: [u8; RAM_LEN], rng: RngMode) -> Self {
         let mut engine = Self {
             ram,
             initial: ram,
@@ -80,27 +117,39 @@ impl Engine {
             pending_input: 0,
             last_input: 0,
             unsupported: 0,
-            seeded_rng: seed.map(|seed| SeededRng { seed, state: seed }),
+            rng,
             #[cfg(feature = "reference-rng")]
             reference_rng: None,
         };
+        if let RngMode::Cartridge(cartridge) = &engine.rng {
+            cartridge.apply_phase(&mut engine.ram);
+        }
         engine.check_support();
         engine
     }
 
     pub fn reset(&mut self) {
-        *self = Self::with_seed(self.initial, self.seeded_rng.as_ref().map(|rng| rng.seed));
+        *self = Self::with_rng(self.initial, self.rng.restarted());
     }
 
     pub fn is_seeded(&self) -> bool {
-        self.seeded_rng.is_some()
+        !matches!(self.rng, RngMode::Legacy)
+    }
+
+    #[cfg(test)]
+    pub fn is_cartridge(&self) -> bool {
+        matches!(self.rng, RngMode::Cartridge(_))
     }
 
     pub fn reseed(&mut self, seed: u64) -> bool {
-        if !self.is_seeded() {
-            return false;
-        }
-        *self = Self::new_seeded(self.initial, seed);
+        let rng = match &self.rng {
+            RngMode::Legacy => return false,
+            RngMode::SplitMix(_) => RngMode::SplitMix(SeededRng { seed, state: seed }),
+            RngMode::Cartridge(rng) => RngMode::Cartridge(
+                crate::cartridge::CartridgeRng::new(seed, rng.trace.clone()),
+            ),
+        };
+        *self = Self::with_rng(self.initial, rng);
         true
     }
 
@@ -109,12 +158,13 @@ impl Engine {
     }
 
     pub(crate) fn random_byte(&mut self) -> u8 {
-        if let Some(rng) = &mut self.seeded_rng {
+        if let RngMode::SplitMix(rng) = &mut self.rng {
             self.ram[0x10] = self.ram[0x10].wrapping_add(1);
             let result = rng.next_byte();
             self.ram[0x0f] = result;
             return result;
         }
+        // Legacy and cartridge modes share the exact cartridge arithmetic:
         // $D44D mixes the incremented zero-page cursor, including ADC carry.
         let first = u16::from(self.ram[0x0f].wrapping_mul(7)) + u16::from(self.ram[0x0a]);
         self.ram[0x10] = self.ram[0x10].wrapping_add(1);
@@ -179,6 +229,10 @@ impl Engine {
         let input = self.pending_input;
         self.pending_input = action;
         self.frame = self.frame.wrapping_add(1);
+        if let RngMode::Cartridge(cartridge) = &self.rng {
+            // Between-update sound/NMI zero-page writes, replayed per frame.
+            cartridge.apply_scratch(&mut self.ram, self.frame);
+        }
         self.ram[0x0b] = self.ram[0x0b].wrapping_add(1);
         if self.ram[0x0b] & 63 == 0 {
             self.ram[0x0a] = self.ram[0x0a].wrapping_add(1);
@@ -747,6 +801,100 @@ mod tests {
         assert_eq!(e.random_byte(), 72);
         e.ram[0x0f] = 9;
         assert_eq!(e.random_byte(), 79);
+    }
+
+    #[test]
+    fn cartridge_mode_derives_rng_phase_from_the_seed_and_runs_the_cartridge_formula() {
+        let trace = crate::cartridge::ScratchTrace::empty();
+        let mut e = Engine::new_cartridge(scene(), 0, trace.clone());
+        assert!(e.is_seeded() && e.is_cartridge());
+        // cartridge-rng-v1 expansion is pinned: SplitMix64-v1 high bytes of seed 0.
+        assert_eq!((e.ram[0x0f], e.ram[0x10]), (0xe2, 0x6e));
+        let mut expected = scene();
+        expected[0x0f] = 0xe2;
+        expected[0x10] = 0x6e;
+        assert_eq!(e.ram, expected);
+        // The stream is exactly the legacy cartridge formula from that phase.
+        let mut legacy = Engine::new(expected);
+        for _ in 0..16 {
+            assert_eq!(e.random_byte(), legacy.random_byte());
+        }
+        let other = Engine::new_cartridge(scene(), 1, trace);
+        assert_eq!((other.ram[0x0f], other.ram[0x10]), (0x91, 0xbe));
+    }
+
+    #[test]
+    fn cartridge_reset_and_reseed_reproduce_phase_scratch_and_trajectory() {
+        let trace = std::sync::Arc::new(
+            crate::cartridge::ScratchTrace::new(vec![0x5c, 0x77], vec![1, 2, 3, 4, 5, 6]).unwrap(),
+        );
+        let mut e = Engine::new_cartridge(enemy_scene(), 0, trace);
+        let initial_with_phase = e.ram;
+        for _ in 0..8 { e.step(129); }
+        let expected = e.ram;
+        let expected_rng = e.random_byte();
+        e.reset();
+        assert_eq!(e.ram, initial_with_phase);
+        assert_eq!((e.frame, e.kills, e.deaths, e.shots, e.pickups), (0, 0, 0, 0, 0));
+        for _ in 0..8 { e.step(129); }
+        assert_eq!(e.ram, expected);
+        assert_eq!(e.random_byte(), expected_rng);
+        assert!(e.reseed(1));
+        assert_ne!(
+            (e.ram[0x0f], e.ram[0x10]),
+            (initial_with_phase[0x0f], initial_with_phase[0x10])
+        );
+        let rest_untouched = e.ram.iter().enumerate()
+            .all(|(a, &v)| matches!(a, 0x0f | 0x10) || v == enemy_scene()[a]);
+        assert!(rest_untouched);
+    }
+
+    #[test]
+    fn cartridge_scratch_replay_feeds_only_the_walking_cursor() {
+        let trace = std::sync::Arc::new(
+            crate::cartridge::ScratchTrace::new(vec![0x5c], vec![77]).unwrap(),
+        );
+        // scene() has no live enemy, so this step consumes no random draws:
+        // the only difference a scratch row may make is the overlaid byte itself.
+        let mut e = Engine::new_cartridge(scene(), 0, trace);
+        e.step(0);
+        let mut bare = Engine::new_cartridge(scene(), 0, crate::cartridge::ScratchTrace::empty());
+        bare.step(0);
+        let mut expected = bare.ram;
+        expected[0x5c] = 77;
+        assert_eq!(e.ram, expected);
+        // The replayed byte is observable to the cartridge formula's cursor read.
+        e.ram[0x0f] = 0;
+        e.ram[0x0a] = 0;
+        e.ram[0x10] = 0x5b;
+        assert_eq!(e.random_byte(), 77);
+    }
+
+    #[test]
+    fn cartridge_mode_accepts_the_same_experimental_mechanics_as_seeded() {
+        let mut r = enemy_scene();
+        r[0x7f] = 1;
+        r[0x442] = 33;
+        let e = Engine::new_cartridge(r, 0, crate::cartridge::ScratchTrace::empty());
+        assert_eq!(e.unsupported(), 0);
+        let mut invalid = scene();
+        invalid[0x7f] = 1;
+        invalid[0x6c] = 0;
+        let mut e = Engine::new_cartridge(invalid, 0, crate::cartridge::ScratchTrace::empty());
+        e.step(0);
+        assert_eq!(e.unsupported(), UNSUPPORTED_SPAWNING);
+    }
+
+    #[cfg(feature = "reference-rng")]
+    #[test]
+    fn cartridge_engines_reject_all_diagnostic_updates_without_mutation() {
+        let mut e = Engine::new_cartridge(enemy_scene(), 0, crate::cartridge::ScratchTrace::empty());
+        let constructed = e.ram;
+        assert_eq!(e.step_with_reference_rng(128, &[]), u32::MAX);
+        assert_eq!(e.logic_with_reference_rng(128, 128, 1, 2, &[]), u32::MAX);
+        assert_eq!(e.logic_with_native_rng(128, 128, 1, 2), u32::MAX);
+        assert_eq!(e.ram, constructed);
+        assert_eq!(e.frame, 0);
     }
 
     fn enemy_scene() -> [u8; RAM_LEN] {
