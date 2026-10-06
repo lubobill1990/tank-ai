@@ -90,8 +90,14 @@ HOW YOU SEE THE WORLD each turn:
   change plan, pick a concrete target enemy and drive/align to it.
 
 Priorities, in order: (1) survive - dodge any bullet on your line; (2) keep the
-base safe - intercept any enemy in the bottom rows or heading for the base;
-(3) hunt - align with an enemy and fire to kill all 20. Do not wander.
+base safe - ONLY when an enemy has reached the bottom third (row >= 17) or a
+bullet threatens the base, drop everything and intercept it; (3) otherwise HUNT
+actively. You CANNOT win by camping near the base: enemies seldom attack it
+early, they keep spawning, and you must destroy all 20. So while no enemy is in
+the bottom third, drive UP into the arena toward the nearest enemy, get onto its
+row or column (nothing solid between), and fire - brick walls block your shots,
+so move around them to get a clean line. Pick ONE concrete target enemy and
+close on it rather than hovering. Do not wander and do not camp.
 
 Answer FORMAT - strict, exactly these five lines in this order and nothing else:
 PLAN: <your MACRO goal; a durable multi-turn intention, e.g. "hold the base
@@ -290,28 +296,46 @@ class DirectPilot(Commander):
         # Blocks carry cache_control (system + terrain) in case the gateway ever
         # honours prompt caching; it currently bills every token fresh, so the
         # global terrain map is only re-sent periodically (the live ego view in
-        # the dynamic block carries current local walls every turn). Prefill
-        # "PLAN:" so the reply is the structured goal/assessment/action block
-        # (macro+micro goals, reason) in a fixed, parseable order.
+        # the dynamic block carries current local walls every turn).
         content = []
         if include_terrain:
             content.append({'type': 'text',
                             'text': getattr(self, '_static_terrain', ''),
                             'cache_control': {'type': 'ephemeral'}})
         content.append({'type': 'text', 'text': dynamic_text})
-        payload = {
-            'model': self.model, 'max_tokens': 170,
-            'system': [{'type': 'text', 'text': DIRECT_SYSTEM,
-                        'cache_control': {'type': 'ephemeral'}}],
-            'messages': [
-                {'role': 'user', 'content': content},
-                {'role': 'assistant', 'content': 'PLAN:'},
-            ],
-        }
-        if 'opus' not in self.model:
-            payload['temperature'] = 0.2
-        reply = 'PLAN:' + self._post(payload, dynamic_text)
-        action, hold = self._parse_action(reply)
+        messages = [{'role': 'user', 'content': content}]
+        # sonnet-5 / opus-5 run with extended thinking on this gateway, which
+        # forbids assistant-prefill and temperature and needs a larger token
+        # budget (thinking + answer). They still emit the PLAN/.../ACTION format
+        # on their own, parsed by regex. Haiku has no thinking, so we prefill
+        # "PLAN:" to force the structured block cheaply.
+        thinking = ('sonnet' in self.model) or ('opus' in self.model)
+        if thinking:
+            # Extended thinking is forced on and cannot be capped/disabled on
+            # this gateway (the 'thinking' param 500s), so max_tokens must be
+            # large enough that the thinking budget PLUS the ~80-token answer
+            # fit - otherwise thinking eats the whole budget and the reply is
+            # empty, silently defaulting the move to wait.
+            payload = {'model': self.model, 'max_tokens': 2000,
+                       'system': [{'type': 'text', 'text': DIRECT_SYSTEM,
+                                   'cache_control': {'type': 'ephemeral'}}],
+                       'messages': messages}
+            reply = self._post(payload, dynamic_text)
+        else:
+            messages.append({'role': 'assistant', 'content': 'PLAN:'})
+            payload = {'model': self.model, 'max_tokens': 170, 'temperature': 0.2,
+                       'system': [{'type': 'text', 'text': DIRECT_SYSTEM,
+                                   'cache_control': {'type': 'ephemeral'}}],
+                       'messages': messages}
+            reply = 'PLAN:' + self._post(payload, dynamic_text)
+        # If no ACTION line survived (e.g. thinking consumed the whole budget),
+        # repeat the last committed action rather than silently freezing on wait.
+        if re.search(r'ACTION:\s*[0-9]', reply, re.IGNORECASE):
+            action, hold = self._parse_action(reply)
+        else:
+            self.empty_replies = getattr(self, 'empty_replies', 0) + 1
+            action, hold = getattr(self, '_last_action', 0), 1
+        self._last_action = action
         self._plan = self._extract(reply, 'PLAN') or getattr(self, '_plan', '')
         self._subgoal = self._extract(reply, 'SUBGOAL') or getattr(self, '_subgoal', '')
         return (action, hold), reply
